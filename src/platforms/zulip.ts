@@ -1,33 +1,147 @@
 /**
  * ZulipAdapter — Zulip implementation of PlatformAdapter.
  *
- * Channel ID format: zulip:{stream_name}
- * Threads map to Zulip topics: incoming messages carry the topic as threadId,
- * and outgoing publishes route to the topic of the most recent incoming
- * message on the channel (falling back to 'mcpl').
+ * Channel ids:
+ *   zulip:{stream_name}      a stream; threads map to topics (incoming carries
+ *                            the topic as threadId; publishes route to the
+ *                            topic of the most recent incoming message, else
+ *                            'mcpl')
+ *   zulip:dm:{ids}           a direct-message conversation, keyed by the
+ *                            other parties' sorted user ids (see history.ts)
+ *
+ * DM conversations are discovered from recent DM history at startup and
+ * described on the fly when a message from a new conversation arrives.
  */
 
 import type {
   ChannelDescriptor,
-  ChannelIncomingMessage,
-  McplContentBlock,
-  McplContextInjection,
-  McplTextContent,
-} from '../mcpl/types.js';
-import type { PlatformAdapter, PublishResult, RoutingHints, OnIncomingMessage, OnSystemEvent } from './adapter.js';
+  ContentBlock,
+  ContextInjection,
+  IncomingChannelMessage,
+  TextContent,
+} from '@animalabs/mcpl-core';
+import type {
+  ChannelHistoryPage,
+  ChannelHistoryQuery,
+  OnIncomingMessage,
+  OnReaction,
+  OnSystemEvent,
+  PlatformAdapter,
+  PublishResult,
+  RoutingHints,
+} from './adapter.js';
 import { ZulipEventLoop } from './zulip-events.js';
-import { cleanContent, extractZulipAttachments } from '../content.js';
+import { chunkMessage } from '../content.js';
+import {
+  assertApiSuccess,
+  channelIdOf,
+  dmCounterparts,
+  dmDescriptor,
+  fetchHistory,
+  normalizeMessage,
+  parseDmChannelId,
+  toIncoming,
+  type ZulipIdentity,
+  type ZulipMessage,
+  type ZulipRawMessage,
+} from '../history.js';
+
+/** The address every stream descriptor carries. */
+export interface ZulipChannelAddress {
+  stream_name: string;
+  stream_id: number;
+}
+
+export function zulipChannelId(streamName: string): string {
+  return `zulip:${streamName}`;
+}
+
+/** The stream behind a `zulip:{stream_name}` channel id. */
+export function streamNameOf(channelId: string): string {
+  return channelId.slice('zulip:'.length);
+}
+
+const SNIPPET_MAX = 80;
+
+/** One line of a message body, whitespace collapsed, capped; null when empty. */
+export function snippetOf(text: string): string | null {
+  const one = text.replace(/\s+/g, ' ').trim();
+  if (!one) return null;
+  return one.length > SNIPPET_MAX ? `${one.slice(0, SNIPPET_MAX - 1)}…` : one;
+}
+
+function isDmChannelIdLocal(channelId: string): boolean {
+  return parseDmChannelId(channelId) !== null;
+}
+
+function addressOf(descriptor: ChannelDescriptor | undefined): Partial<ZulipChannelAddress> {
+  const address = descriptor?.address;
+  return typeof address === 'object' && address !== null ? (address as Partial<ZulipChannelAddress>) : {};
+}
+
+/** The live filters the adapter consults — the plane, or a stand-in. */
+export interface FilterView {
+  streamAllowed(streamName: string): boolean;
+  dmAllowed(sender: { id: number; email: string }): boolean;
+}
+
+const ALLOW_ALL: FilterView = { streamAllowed: () => true, dmAllowed: () => true };
+
+export interface ZulipAdapterOptions {
+  /** Backscroll cap advertised per channel and enforced on channels/open. */
+  backscrollDefault?: number;
+  /** Per-stream overrides of the backscroll cap. */
+  backscrollLimits?: ReadonlyMap<string, number>;
+  /** Stream allowlist + DM allowlist, read live on every event. */
+  filters?: FilterView;
+  /** How many recent DMs to scan for conversations at startup. */
+  dmDiscoveryLimit?: number;
+  /** The realm's max message length; longer publishes are split. */
+  maxMessageLength?: number;
+}
+
+export const DEFAULT_BACKSCROLL = 500;
+const DEFAULT_DM_DISCOVERY_LIMIT = 300;
 
 export class ZulipAdapter implements PlatformAdapter {
   readonly type = 'zulip';
 
   private eventLoop: ZulipEventLoop | null = null;
+  private readonly identity: ZulipIdentity;
+  private readonly backscrollDefault: number;
+  private readonly backscrollLimits: ReadonlyMap<string, number>;
+  private readonly filters: FilterView;
+  private readonly dmDiscoveryLimit: number;
+  private readonly maxMessageLength: number | undefined;
+  /** DM conversations already described to the server, by channel id. */
+  private knownDms = new Map<string, ChannelDescriptor>();
+  /** Recently seen messages, so a reaction can be placed without a round
+   *  trip: id → channel, author, snippet. Bounded; oldest evicted. */
+  private seen = new Map<number, { channelId: string; authorId: number; snippet: string | null }>();
+  private static readonly SEEN_CAP = 2000;
 
   constructor(
     private zulipClient: any,
-    private selfUserId: number | null,
-    private sessionId: string,
-  ) {}
+    selfUserId: number | null,
+    sessionId: string,
+    options: ZulipAdapterOptions = {},
+  ) {
+    this.identity = { selfUserId, sessionId };
+    this.backscrollDefault = options.backscrollDefault ?? DEFAULT_BACKSCROLL;
+    this.backscrollLimits = options.backscrollLimits ?? new Map();
+    this.filters = options.filters ?? ALLOW_ALL;
+    this.dmDiscoveryLimit = options.dmDiscoveryLimit ?? DEFAULT_DM_DISCOVERY_LIMIT;
+    this.maxMessageLength = options.maxMessageLength;
+  }
+
+  /** The history cap for a stream (descriptor `capabilities.history.maxMessages`). */
+  backscrollLimitFor(streamName: string): number {
+    return this.backscrollLimits.get(streamName) ?? this.backscrollDefault;
+  }
+
+  get selfUserId(): number | null {
+    return this.identity.selfUserId;
+  }
 
   async discoverChannels(): Promise<ChannelDescriptor[]> {
     const channels: ChannelDescriptor[] = [];
@@ -38,55 +152,151 @@ export class ZulipAdapter implements PlatformAdapter {
       });
       const streams = result.streams || [];
       for (const stream of streams) {
+        if (!this.filters.streamAllowed(stream.name)) continue;
+        const address: ZulipChannelAddress = { stream_name: stream.name, stream_id: stream.stream_id };
         channels.push({
-          id: `zulip:${stream.name}`,
+          id: zulipChannelId(stream.name),
           type: 'zulip',
           label: `#${stream.name}`,
           direction: 'bidirectional',
-          address: { stream_name: stream.name, stream_id: stream.stream_id },
+          address,
           metadata: {
             subscriber_count: stream.subscriber_count,
             is_public: !stream.invite_only,
+          },
+          capabilities: {
+            history: {
+              maxMessages: this.backscrollLimitFor(stream.name),
+              supportsBeforeMessage: true,
+              supportsSinceLastSeen: true,
+            },
           },
         });
       }
     } catch (error) {
       console.error('Failed to discover Zulip streams:', error);
     }
+    channels.push(...(await this.discoverDmChannels()));
     return channels;
+  }
+
+  /**
+   * DM conversations the bot has been part of recently. Zulip has no
+   * "list my DM conversations" call; the recent DM history is the source.
+   */
+  private async discoverDmChannels(): Promise<ChannelDescriptor[]> {
+    if (this.dmDiscoveryLimit <= 0) return [];
+    try {
+      const result = await this.zulipClient.messages.retrieve({
+        anchor: 'newest',
+        num_before: this.dmDiscoveryLimit,
+        num_after: 0,
+        narrow: [['is', 'dm']],
+        apply_markdown: false,
+        include_anchor: true,
+      });
+      assertApiSuccess(result, 'recent direct messages');
+      for (const raw of (result?.messages ?? []) as ZulipRawMessage[]) {
+        const m = normalizeMessage(raw);
+        if (!m.isDm) continue;
+        if (!this.filters.dmAllowed({ id: m.authorId, email: m.authorEmail }) && m.authorId !== this.identity.selfUserId) continue;
+        this.describeDm(m);
+      }
+    } catch (error) {
+      console.error('Failed to discover Zulip DM conversations:', (error as Error).message);
+    }
+    return [...this.knownDms.values()];
+  }
+
+  private remember(channelId: string, m: ZulipMessage): void {
+    if (this.seen.size >= ZulipAdapter.SEEN_CAP) {
+      const oldest = this.seen.keys().next().value;
+      if (oldest !== undefined) this.seen.delete(oldest);
+    }
+    this.seen.set(m.id, { channelId, authorId: m.authorId, snippet: snippetOf(m.cleanContent) });
+  }
+
+  /** Where a message lives — from the recent-messages cache, else one GET. */
+  private async locate(messageId: number): Promise<{ channelId: string; authorId: number; snippet: string | null } | null> {
+    const cached = this.seen.get(messageId);
+    if (cached) return cached;
+    try {
+      const result = await this.zulipClient.messages.getById({ message_id: messageId, apply_markdown: false });
+      assertApiSuccess(result, `message ${messageId}`);
+      const raw = result?.message as ZulipRawMessage | undefined;
+      if (!raw) return null;
+      const m = normalizeMessage(raw);
+      const channelId = channelIdOf(m, this.identity.selfUserId);
+      this.remember(channelId, m);
+      return this.seen.get(messageId) ?? null;
+    } catch (err) {
+      console.error(`[zulip-mcp] could not resolve message ${messageId} for a reaction:`, (err as Error).message);
+      return null;
+    }
+  }
+
+  /** The descriptor for a DM's conversation, remembered once described. */
+  private describeDm(m: ZulipMessage): { descriptor: ChannelDescriptor; isNew: boolean } {
+    const counterparts = dmCounterparts(m.recipients, this.identity.selfUserId);
+    const descriptor = dmDescriptor(counterparts, this.backscrollDefault);
+    const isNew = !this.knownDms.has(descriptor.id);
+    this.knownDms.set(descriptor.id, descriptor);
+    return { descriptor, isNew };
   }
 
   async publish(
     channelId: string,
     _descriptor: ChannelDescriptor | undefined,
-    content: McplContentBlock[],
+    content: ContentBlock[],
     hints?: RoutingHints,
   ): Promise<PublishResult> {
     const textContent = content
-      .filter((c): c is McplTextContent => c.type === 'text')
+      .filter((c): c is TextContent => c.type === 'text')
       .map(c => c.text)
       .join('\n');
     if (!textContent) return { delivered: false };
 
-    // channelId format: zulip:{stream_name}
-    const streamName = channelId.slice('zulip:'.length);
+    const dmIds = parseDmChannelId(channelId);
+    let target: Record<string, unknown>;
+    let what: string;
+    if (dmIds) {
+      target = { type: 'private', to: dmIds };
+      what = `direct message to ${channelId}`;
+    } else {
+      const streamName = streamNameOf(channelId);
+      // Route to the topic of the most recent incoming message on this channel
+      // (in-thread answers); fall back to the 'mcpl' topic when the agent
+      // initiates the conversation.
+      const topic =
+        (typeof hints?.metadata?.topic === 'string' ? hints.metadata.topic : undefined) ??
+        hints?.threadId ??
+        'mcpl';
+      target = { type: 'stream', to: streamName, topic };
+      what = `message to #${streamName}`;
+    }
 
-    // Route to the topic of the most recent incoming message on this channel
-    // (in-thread answers); fall back to the 'mcpl' topic when the agent
-    // initiates the conversation.
-    const topic =
-      (typeof hints?.metadata?.topic === 'string' ? hints.metadata.topic : undefined) ??
-      hints?.threadId ??
-      'mcpl';
+    // Zulip rejects anything over the realm's max_message_length; a long
+    // reply goes out as several messages rather than failing whole.
+    const messageIds: string[] = [];
+    for (const chunk of chunkMessage(textContent, this.maxMessageLength)) {
+      const result = await this.zulipClient.messages.send({ ...target, content: chunk });
+      assertApiSuccess(result, what);
+      messageIds.push(String(result.id));
+    }
+    return { delivered: true, messageId: messageIds[messageIds.length - 1], messageIds };
+  }
 
-    const result = await this.zulipClient.messages.send({
-      type: 'stream',
-      to: streamName,
-      topic,
-      content: textContent,
-    });
+  /** Mark a message as seen: a reaction, 👀 by default. `value` may be an emoji name (':eyes:' / 'eyes'). */
+  async acknowledge(_channelId: string, messageId: string, value?: string): Promise<string> {
+    const name = (value ?? '').trim().replace(/^:|:$/g, '') || 'eyes';
+    const result = await this.zulipClient.reactions.add({ message_id: Number(messageId), emoji_name: name, reaction_type: 'unicode_emoji' });
+    assertApiSuccess(result, `acknowledging message ${messageId}`);
+    return `:${name}:`;
+  }
 
-    return { delivered: true, messageId: String(result.id) };
+  async deleteMessage(_channelId: string, messageId: string): Promise<void> {
+    const result = await this.zulipClient.messages.deleteById({ message_id: Number(messageId) });
+    assertApiSuccess(result, `deleting message ${messageId}`);
   }
 
   /**
@@ -111,22 +321,21 @@ export class ZulipAdapter implements PlatformAdapter {
     metadata: Record<string, unknown> | undefined,
     op: 'start' | 'stop',
   ): Promise<void> {
-    const streamId = descriptor?.address?.stream_id as number | undefined;
-    if (!streamId) {
-      console.error(`[zulip-mcp] sendTyping: no stream_id for ${channelId} (descriptor=${descriptor ? 'present' : 'missing'})`);
-      return;
-    }
-
-    const topic = typeof metadata?.topic === 'string' ? metadata.topic : 'mcpl';
-
+    const send = this.zulipClient.typing.send as (p: unknown) => Promise<{ result?: string; msg?: string }>;
+    const dmIds = parseDmChannelId(channelId);
     try {
-      const result = await (this.zulipClient.typing.send as (p: unknown) => Promise<{ result?: string; msg?: string }>)({
-        type: 'stream',
-        stream_id: streamId,
-        topic,
-        op,
-        to: [],
-      });
+      let result: { result?: string; msg?: string };
+      if (dmIds) {
+        result = await send({ type: 'direct', to: dmIds, op });
+      } else {
+        const streamId = addressOf(descriptor).stream_id;
+        if (!streamId) {
+          console.error(`[zulip-mcp] sendTyping: no stream_id for ${channelId} (descriptor=${descriptor ? 'present' : 'missing'})`);
+          return;
+        }
+        const topic = typeof metadata?.topic === 'string' ? metadata.topic : 'mcpl';
+        result = await send({ type: 'stream', stream_id: streamId, topic, op, to: [] });
+      }
       if (result?.result && result.result !== 'success') {
         console.error(`[zulip-mcp] typing.send(${op}) non-success: ${result.result} ${result.msg ?? ''}`);
       }
@@ -136,76 +345,153 @@ export class ZulipAdapter implements PlatformAdapter {
     }
   }
 
+  /**
+   * The allowlists, applied to what a history read may hand on: a message
+   * from a stream outside `streams`, or a DM from a sender outside `dmUsers`,
+   * is withheld here the same way the live event path withholds it — so a
+   * narrowed allowlist is enforced on catch-up, gap recovery, backscroll and
+   * context injection, not only on live delivery. The bot's own messages
+   * pass (they are its own doing); callers decide whether to show them.
+   */
+  private allowed(m: ZulipMessage): boolean {
+    if (this.identity.selfUserId !== null && m.authorId === this.identity.selfUserId) return true;
+    if (m.isDm) return this.filters.dmAllowed({ id: m.authorId, email: m.authorEmail });
+    return m.streamName === null || this.filters.streamAllowed(m.streamName);
+  }
+
   async fetchContext(
     channelId: string,
     _descriptor: ChannelDescriptor | undefined,
     historySize: number,
-  ): Promise<McplContextInjection | null> {
-    const streamName = channelId.slice('zulip:'.length);
-
-    const result = await this.zulipClient.messages.retrieve({
-      anchor: 'newest',
-      num_before: historySize,
-      num_after: 0,
-      narrow: [['stream', streamName]],
-    });
-
-    const messages = result.messages || [];
+  ): Promise<ContextInjection | null> {
+    const dmIds = parseDmChannelId(channelId);
+    if (!dmIds && !this.filters.streamAllowed(streamNameOf(channelId))) return null;
+    const page = await fetchHistory(this.zulipClient, dmIds
+      ? { dmUserIds: dmIds, limit: historySize }
+      : { streamName: streamNameOf(channelId), limit: historySize });
+    const messages = page.messages.filter((m) => this.allowed(m));
     if (messages.length === 0) return null;
 
-    const formatted = messages.map((msg: any) => {
-      const time = new Date(msg.timestamp * 1000).toLocaleTimeString('en-US', {
-        hour: '2-digit', minute: '2-digit',
-      });
-      const content = cleanContent(msg.content);
-      return `[${time}] [${msg.subject}] ${msg.sender_full_name}: ${content}`;
+    const formatted = messages.map((m) => {
+      const time = m.timestamp.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+      return dmIds
+        ? `[${time}] ${m.authorName}: ${m.cleanContent}`
+        : `[${time}] [${m.topic}] ${m.authorName}: ${m.cleanContent}`;
     }).join('\n');
 
+    const label = dmIds ? `the direct-message conversation ${channelId}` : `Zulip #${streamNameOf(channelId)}`;
     return {
-      namespace: `zulip:${streamName}`,
+      namespace: channelId,
       position: 'beforeUser',
-      content: `Recent messages from Zulip #${streamName}:\n${formatted}`,
+      content: `Recent messages from ${label}:\n${formatted}`,
     };
   }
 
-  startEvents(onMessage: OnIncomingMessage, onSystemEvent?: OnSystemEvent): void {
+  /**
+   * History as incoming-shaped messages, oldest first, the bot's own
+   * messages excluded (they are already in the agent's own record as its
+   * turns) and disallowed senders withheld. Marked `backscroll: true` so
+   * consumers can tell replayed history from live delivery. The page's
+   * `scannedThrough` covers the excluded rows too, so a pager never mistakes
+   * a page of nothing but the bot's own messages for the end of history.
+   */
+  async fetchHistory(channelId: string, query: ChannelHistoryQuery): Promise<ChannelHistoryPage> {
+    const dmIds = parseDmChannelId(channelId);
+    if (!dmIds && !this.filters.streamAllowed(streamNameOf(channelId))) {
+      return { messages: [], scannedThrough: null, reachedNewest: true };
+    }
+    const page = await fetchHistory(this.zulipClient, {
+      ...(dmIds ? { dmUserIds: dmIds } : { streamName: streamNameOf(channelId) }),
+      limit: query.limit,
+      before: query.beforeMessageId !== undefined ? Number(query.beforeMessageId) : undefined,
+      after: query.afterMessageId !== undefined ? Number(query.afterMessageId) : undefined,
+    });
+    for (const m of page.messages) this.remember(channelId, m);
+    const messages = page.messages
+      .filter((m) => this.identity.selfUserId === null || m.authorId !== this.identity.selfUserId)
+      .filter((m) => this.allowed(m))
+      .map((m) => toIncoming(channelId, m, this.identity, { backscroll: true }));
+    return {
+      messages,
+      scannedThrough: page.messages.length > 0 ? page.messages[page.messages.length - 1].id : null,
+      reachedNewest: page.foundNewest,
+    };
+  }
+
+  /**
+   * Zulip delivers stream events only to subscribers — even with
+   * `all_public_streams` on the queue — so opening a channel must also
+   * subscribe the bot, or the host would be listening to silence.
+   * Idempotent; subscription persists server-side. DMs need nothing.
+   *
+   * Asks Zulip every time rather than remembering: the `unlisten` tool
+   * removes subscriptions behind this adapter's back, and a remembered
+   * "subscribed" would let a later open succeed onto silence. The add call
+   * is cheap and answers `already_subscribed` when there is nothing to do.
+   *
+   * Throws when the subscription did not happen: an API error, a transport
+   * failure, or — Zulip's way of refusing a private stream — a `success`
+   * result that lists the stream under `unauthorized`. The caller (the open
+   * lifecycle) turns that into a failed open rather than a silent one.
+   */
+  async ensureSubscribed(channelId: string): Promise<void> {
+    if (parseDmChannelId(channelId)) return;
+    const streamName = streamNameOf(channelId);
+    const result = await this.zulipClient.users.me.subscriptions.add({
+      subscriptions: [{ name: streamName }],
+    });
+    assertApiSuccess(result, `subscribing to #${streamName}`);
+    const unauthorized: string[] = Array.isArray(result?.unauthorized) ? result.unauthorized : [];
+    if (unauthorized.includes(streamName)) {
+      throw new Error(`not authorized to subscribe to #${streamName} (private stream; the bot must be invited)`);
+    }
+    const fresh = result.subscribed && Object.keys(result.subscribed).length > 0;
+    if (fresh) console.error(`[zulip-mcp] subscribed to #${streamName} for channel ${channelId}`);
+  }
+
+  startEvents(onMessage: OnIncomingMessage, onSystemEvent?: OnSystemEvent, onReaction?: OnReaction): void {
     this.eventLoop = new ZulipEventLoop();
-    this.eventLoop.start(this.zulipClient, (streamName, msg, flags) => {
-      if (this.selfUserId !== null && msg.sender_id === this.selfUserId) return;
-      const channelId = `zulip:${streamName}`;
-      const cleaned = cleanContent(msg.content);
-      const attachments = extractZulipAttachments(msg.content);
-      const content: McplTextContent[] = [{ type: 'text', text: cleaned }];
-      if (attachments.length > 0) {
-        // Reference-only by default: agent reads the note, then decides
-        // whether to call fetch_attachment to pull bytes into context.
-        const lines = attachments.map(a =>
-          `- ${a.name} (${a.mimeType})${a.isImage ? ' — image, fetchable via fetch_attachment' : ''}: ${a.path}`,
-        );
-        content.push({
-          type: 'text',
-          text: `[attachments: ${attachments.length}]\n${lines.join('\n')}`,
-        });
+    const reactionHandler = onReaction
+      ? (ev: import('./zulip-events.js').ZulipReactionEvent) => {
+          // The bot's own reactions are its own doing; only others' are news.
+          if (this.identity.selfUserId !== null && ev.user_id === this.identity.selfUserId) return;
+          void this.locate(ev.message_id).then((where) => {
+            if (!where) return;
+            if (!isDmChannelIdLocal(where.channelId) && !this.filters.streamAllowed(streamNameOf(where.channelId))) return;
+            onReaction({
+              action: ev.op,
+              channelId: where.channelId,
+              messageId: String(ev.message_id),
+              emoji: ev.emoji_name,
+              emojiCode: ev.emoji_code || undefined,
+              emojiType: ev.reaction_type || undefined,
+              reactorId: String(ev.user_id),
+              reactorName: ev.user?.full_name ?? `user ${ev.user_id}`,
+              onOwnMessage: this.identity.selfUserId !== null && where.authorId === this.identity.selfUserId,
+              messageSnippet: where.snippet,
+              timestamp: new Date(),
+            });
+          });
+        }
+      : undefined;
+    this.eventLoop.start(this.zulipClient, (_streamName, msg, flags) => {
+      const m = normalizeMessage({ ...(msg as ZulipRawMessage), flags });
+      // Remember our own messages too: reactions to them are the ones that
+      // matter most ("someone reacted to your message").
+      this.remember(m.isDm ? dmDescriptor(dmCounterparts(m.recipients, this.identity.selfUserId), 0).id : channelIdOf(m, this.identity.selfUserId), m);
+      if (this.identity.selfUserId !== null && msg.sender_id === this.identity.selfUserId) return;
+      if (m.isDm) {
+        if (!this.filters.dmAllowed({ id: m.authorId, email: m.authorEmail })) {
+          console.error(`[zulip-mcp] dropping DM from ${m.authorEmail} (${m.authorId}): not in the dmUsers allowlist`);
+          return;
+        }
+        const { descriptor, isNew } = this.describeDm(m);
+        onMessage(toIncoming(descriptor.id, m, this.identity), isNew ? descriptor : undefined);
+        return;
       }
-      const incoming: ChannelIncomingMessage = {
-        channelId,
-        messageId: String(msg.id),
-        threadId: msg.subject || undefined,
-        author: { id: String(msg.sender_id), name: msg.sender_full_name },
-        timestamp: new Date(msg.timestamp * 1000).toISOString(),
-        content,
-        metadata: {
-          senderEmail: msg.sender_email,
-          topic: msg.subject,
-          // Zulip's server-computed flag: personal or user-group mention of
-          // the bot. Wildcards (@all/@everyone) deliberately don't count.
-          mentioned: flags.includes('mentioned'),
-          botUserId: this.selfUserId !== null ? String(this.selfUserId) : this.sessionId,
-          ...(attachments.length > 0 ? { attachments } : {}),
-        },
-      };
-      onMessage(incoming);
-    }, onSystemEvent).catch(error => {
+      if (m.streamName !== null && !this.filters.streamAllowed(m.streamName)) return;
+      onMessage(toIncoming(channelIdOf(m, this.identity.selfUserId), m, this.identity));
+    }, onSystemEvent, reactionHandler).catch(error => {
       console.error('Zulip event loop failed:', error);
     });
   }

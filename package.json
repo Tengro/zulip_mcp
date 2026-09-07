@@ -1,7 +1,7 @@
 {
   "name": "zulip-mcp-server",
-  "version": "2.2.1",
-  "description": "Stateful, ergonomic MCP server for Zulip and Discord with ambient awareness, persistent monitoring, and natural date-based queries",
+  "version": "3.0.0",
+  "description": "Stateful, ergonomic MCP/MCPL server for Zulip with ambient awareness, persistent monitoring, and natural date-based queries",
   "type": "module",
   "main": "build/index.js",
   "bin": {
@@ -17,8 +17,8 @@
   "keywords": [
     "mcp",
     "zulip",
-    "discord",
     "model-context-protocol",
+    "mcpl",
     "chat",
     "messaging",
     "stateful",
@@ -30,7 +30,7 @@
   "author": "Antra Tessera",
   "license": "MIT",
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.0.0"
   },
   "files": [
     "build",
@@ -39,10 +39,8 @@
     "zuliprc.example"
   ],
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.4",
-    "@slack/socket-mode": "^2.0.7",
-    "@slack/web-api": "^7.16.0",
-    "discord.js": "^14.16.3",
+    "@animalabs/mcpl-core": "^0.3.0",
+    "sharp": "^0.33.5",
     "zulip-js": "^2.1.0"
   },
   "devDependencies": {

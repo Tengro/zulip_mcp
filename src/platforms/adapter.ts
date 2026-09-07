@@ -1,37 +1,37 @@
 /**
  * PlatformAdapter — the seam between the platform-agnostic MCPL layer
- * (ChannelManager, ContextProvider) and platform-specific clients
- * (Zulip, Discord, Slack, ...).
+ * (ChannelManager, ContextProvider) and the platform-specific client.
  *
- * Each adapter owns one platform connection and is responsible for:
+ * One implementer today (Zulip), but the seam is the documented shape a
+ * platform plugs into, and it costs nothing to keep. An adapter owns one
+ * platform connection and is responsible for:
  *   - discovering channels and describing them (ChannelDescriptor)
  *   - delivering outgoing publishes (with thread routing where supported)
  *   - fetching recent history for context/beforeInference injections
  *   - streaming real-time incoming messages (self-filtered)
  *
- * Channel IDs are prefixed with the adapter's `type` ('zulip:...',
- * 'discord:...', 'slack:...'); the MCPL layer routes purely on that prefix
- * and never inspects the remainder.
+ * Channel IDs are prefixed with the adapter's `type` ('zulip:...'); the MCPL
+ * layer routes purely on that prefix and never inspects the remainder.
  */
 
 import type {
   ChannelDescriptor,
-  ChannelIncomingMessage,
-  McplContentBlock,
-  McplContextInjection,
-} from '../mcpl/types.js';
+  ChannelsPublishResult,
+  ContentBlock,
+  ContextInjection,
+  IncomingChannelMessage,
+} from '@animalabs/mcpl-core';
 
-export interface PublishResult {
-  delivered: boolean;
-  messageId?: string;
-}
+/** `messageIds` lists every platform message a publish produced (a long
+ *  text is chunked); `messageId` is the last of them. */
+export type PublishResult = ChannelsPublishResult & { messageIds?: string[] };
 
 /**
  * Routing hints for outgoing messages, derived by the MCPL layer from the
  * most recent incoming message on the target channel. The host's
  * channels/publish carries no thread information, so "reply where the
  * conversation is" is reconstructed server-side: Zulip maps threadId to a
- * topic, Slack to a thread_ts.
+ * topic.
  */
 export interface RoutingHints {
   /** threadId of the last incoming message on this channel, if any. */
@@ -40,7 +40,12 @@ export interface RoutingHints {
   metadata?: Record<string, unknown>;
 }
 
-export type OnIncomingMessage = (message: ChannelIncomingMessage) => void;
+/**
+ * Delivery callback. `newChannel` is set when the message belongs to a
+ * channel the adapter has not described before (a DM from a new
+ * conversation) — the server registers it with the host before routing.
+ */
+export type OnIncomingMessage = (message: IncomingChannelMessage, newChannel?: ChannelDescriptor) => void;
 
 /**
  * Out-of-band condition on a platform connection that the host/agent should
@@ -64,6 +69,55 @@ export interface PlatformSystemEvent {
 
 export type OnSystemEvent = (event: PlatformSystemEvent) => void;
 
+/** A reaction added to or removed from a message, resolved to its channel. */
+export interface ReactionEvent {
+  action: 'add' | 'remove';
+  channelId: string;
+  messageId: string;
+  /** Emoji name in the platform's vocabulary (Zulip: 'thumbs_up'). */
+  emoji: string;
+  /** The platform's code for the emoji (Zulip: codepoints for unicode emoji,
+   *  the realm emoji id otherwise) — what a glyph-shaped suppression entry
+   *  is matched against. */
+  emojiCode?: string;
+  /** Zulip: 'unicode_emoji' | 'realm_emoji' | 'zulip_extra_emoji'. */
+  emojiType?: string;
+  reactorId: string;
+  reactorName: string;
+  /** The reacted-to message was authored by the bot. */
+  onOwnMessage: boolean;
+  /** One-line snippet of the reacted-to message, or null when unknown. */
+  messageSnippet: string | null;
+  timestamp: Date;
+}
+
+export type OnReaction = (event: ReactionEvent) => void;
+
+/** History request against one channel, in the platform's own id space. */
+export interface ChannelHistoryQuery {
+  limit: number;
+  /** Exclusive: only messages older than this id. */
+  beforeMessageId?: string;
+  /** Exclusive: only messages newer than this id. */
+  afterMessageId?: string;
+}
+
+/**
+ * One page of channel history. `messages` is what may reach the agent —
+ * the bot's own messages and disallowed senders are already removed — while
+ * `scannedThrough` is the newest id the fetch actually covered, removed rows
+ * included: the cursor a pager advances on, so a page of nothing but the
+ * bot's own messages does not read as the end of history.
+ */
+export interface ChannelHistoryPage {
+  /** Oldest first. */
+  messages: IncomingChannelMessage[];
+  /** Newest id scanned (filtered rows included); null when the page was empty. */
+  scannedThrough: number | null;
+  /** The platform reports nothing newer than this page. */
+  reachedNewest: boolean;
+}
+
 export interface PlatformAdapter {
   /** Channel ID prefix and ChannelDescriptor.type, e.g. 'zulip'. */
   readonly type: string;
@@ -78,13 +132,13 @@ export interface PlatformAdapter {
   publish(
     channelId: string,
     descriptor: ChannelDescriptor | undefined,
-    content: McplContentBlock[],
+    content: ContentBlock[],
     hints?: RoutingHints,
   ): Promise<PublishResult>;
 
   /**
    * Best-effort typing indicator. Optional — platforms without a usable
-   * typing API (e.g. Slack bots) simply omit it.
+   * typing API simply omit it.
    */
   sendTyping?(
     channelId: string,
@@ -101,7 +155,26 @@ export interface PlatformAdapter {
     channelId: string,
     descriptor: ChannelDescriptor | undefined,
     historySize: number,
-  ): Promise<McplContextInjection | null>;
+  ): Promise<ContextInjection | null>;
+
+  /**
+   * Channel history as incoming-shaped messages, oldest first. Optional —
+   * without it channels/open cannot return backscroll and the reconnect
+   * sweep has nothing to scan.
+   */
+  fetchHistory?(channelId: string, query: ChannelHistoryQuery): Promise<ChannelHistoryPage>;
+
+  /**
+   * Make sure the platform delivers events for this channel — Zulip only
+   * sends stream events to subscribers. Optional; idempotent; best-effort.
+   */
+  ensureSubscribed?(channelId: string): Promise<void>;
+
+  /** channels/acknowledge — mark a message as seen on the surface (a reaction). Returns the representation used. */
+  acknowledge?(channelId: string, messageId: string, value?: string): Promise<string>;
+
+  /** Delete one of the bot's own messages (rollback). */
+  deleteMessage?(channelId: string, messageId: string): Promise<void>;
 
   /**
    * Start delivering real-time messages. Adapters filter the bot's own
@@ -111,7 +184,7 @@ export interface PlatformAdapter {
    * out-of-band conditions — delivery gaps, degraded polling — so the host
    * can surface them to the agent instead of losing them in stderr.
    */
-  startEvents(onMessage: OnIncomingMessage, onSystemEvent?: OnSystemEvent): void;
+  startEvents(onMessage: OnIncomingMessage, onSystemEvent?: OnSystemEvent, onReaction?: OnReaction): void;
 
   /** Stop event delivery and release platform resources. */
   stopEvents(): void;

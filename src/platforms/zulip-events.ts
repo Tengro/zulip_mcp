@@ -1,8 +1,9 @@
 /**
  * Zulip Event Loop — Real-time message delivery via long-polling.
  *
- * Registers an event queue for message events, polls for new messages,
- * and routes them through a callback. Handles queue expiry recovery
+ * Registers an event queue for message events, polls for new messages
+ * (stream messages and direct messages alike), and routes them through a
+ * callback. Handles queue expiry recovery
  * and graceful shutdown.
  *
  * Failure semantics — grounded in what the vendored client stack
@@ -49,8 +50,22 @@ export interface ZulipEventMessage {
 }
 
 /** `flags` are the receiving user's message flags from the event envelope
- * (e.g. 'mentioned', 'wildcard_mentioned') — computed server-side by Zulip. */
-export type OnZulipMessage = (streamName: string, message: ZulipEventMessage, flags: string[]) => void;
+ * (e.g. 'mentioned', 'wildcard_mentioned') — computed server-side by Zulip.
+ * `streamName` is null for direct messages. */
+export type OnZulipMessage = (streamName: string | null, message: ZulipEventMessage, flags: string[]) => void;
+
+/** A `reaction` event as the queue delivers it. */
+export interface ZulipReactionEvent {
+  op: 'add' | 'remove';
+  emoji_name: string;
+  emoji_code: string;
+  reaction_type: string;
+  message_id: number;
+  user_id: number;
+  user?: { user_id?: number; full_name?: string; email?: string };
+}
+
+export type OnZulipReaction = (event: ZulipReactionEvent) => void;
 
 /**
  * The shape zulip-js `events.retrieve` resolves to. On success it carries an
@@ -58,7 +73,7 @@ export type OnZulipMessage = (streamName: string, message: ZulipEventMessage, fl
  * resolves — NOT rejects — to a `{ result: 'error', code, msg }` object.
  */
 export interface ZulipRetrieveResponse {
-  events?: { id: number; type: string; message?: ZulipEventMessage; flags?: string[] }[];
+  events?: ({ id: number; type: string; message?: ZulipEventMessage; flags?: string[] } & Partial<ZulipReactionEvent>)[];
   result?: string;
   code?: string;
   msg?: string;
@@ -139,10 +154,15 @@ export class ZulipEventLoop {
    * re-register), 'degraded' (polling is failing repeatedly), and 'recovered'
    * (polling is healthy again).
    */
-  async start(zulipClient: ZulipEventClient, onMessage: OnZulipMessage, onSystemEvent?: OnSystemEvent): Promise<void> {
+  async start(
+    zulipClient: ZulipEventClient,
+    onMessage: OnZulipMessage,
+    onSystemEvent?: OnSystemEvent,
+    onReaction?: OnZulipReaction,
+  ): Promise<void> {
     while (!this.stopped) {
       try {
-        await this.pollLoop(zulipClient, onMessage, onSystemEvent);
+        await this.pollLoop(zulipClient, onMessage, onSystemEvent, onReaction);
       } catch (error) {
         if (this.stopped) return;
         console.error('Zulip event loop error, restarting in 5s:', error);
@@ -158,14 +178,19 @@ export class ZulipEventLoop {
     this.stopped = true;
   }
 
-  private async pollLoop(zulipClient: ZulipEventClient, onMessage: OnZulipMessage, onSystemEvent?: OnSystemEvent): Promise<void> {
+  private async pollLoop(
+    zulipClient: ZulipEventClient,
+    onMessage: OnZulipMessage,
+    onSystemEvent?: OnSystemEvent,
+    onReaction?: OnZulipReaction,
+  ): Promise<void> {
     // Register event queue.
     // Two zulip-js quirks to work around:
     //   - Booleans crash FormData serialization; pass "true"/"false" as strings.
     //   - Arrays must be raw JS arrays (the library JSON.stringifies them);
     //     pre-stringified JSON produces "event_types is not a list" at Zulip.
     const registration = await zulipClient.queues.register({
-      event_types: ['message'],
+      event_types: ['message', 'reaction'],
       all_public_streams: 'true',
       apply_markdown: 'false',
     });
@@ -245,6 +270,23 @@ export class ZulipEventLoop {
         for (const event of response.events) {
           lastEventId = event.id;
 
+          if (event.type === 'reaction' && onReaction && typeof event.message_id === 'number') {
+            try {
+              onReaction({
+                op: event.op === 'remove' ? 'remove' : 'add',
+                emoji_name: String(event.emoji_name ?? ''),
+                emoji_code: String(event.emoji_code ?? ''),
+                reaction_type: String(event.reaction_type ?? 'unicode_emoji'),
+                message_id: event.message_id,
+                user_id: Number(event.user_id),
+                user: event.user,
+              });
+            } catch (handlerError) {
+              console.error('Zulip event loop: onReaction handler threw:', handlerError);
+            }
+            continue;
+          }
+
           if (event.type === 'message' && event.message) {
             const msg = event.message as ZulipEventMessage;
             // Anchor future gap markers on the last delivered message — the
@@ -257,14 +299,16 @@ export class ZulipEventLoop {
               ? msg.display_recipient
               : null;
 
-            if (streamName && msg.type === 'stream') {
+            const isStream = msg.type === 'stream' && streamName !== null;
+            const isDm = msg.type === 'private';
+            if (isStream || isDm) {
               // A throwing onMessage is a handler bug, not a poll failure —
               // isolate it so it neither aborts the rest of the batch nor
               // inflates consecutiveFailures toward a bogus 'degraded' marker.
               // The event is already acked (lastEventId advanced); Zulip won't
               // redeliver it, so we log and move on (at-most-once).
               try {
-                onMessage(streamName, msg, event.flags ?? []);
+                onMessage(isStream ? streamName : null, msg, event.flags ?? []);
               } catch (handlerError) {
                 console.error('Zulip event loop: onMessage handler threw:', handlerError);
               }
