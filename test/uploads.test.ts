@@ -1,7 +1,7 @@
 /**
  * Outbound uploads — the multipart POST against a local HTTP server, the
- * attachment-argument loader (local file / base64, the size ceiling), the
- * message-body link form, and the content-block → upload mapping.
+ * root-confined attachment loader (local file / base64, the size ceilings),
+ * the message-body link form, and the content-block → upload mapping.
  *
  * Run: node --import tsx --test test/uploads.test.ts
  */
@@ -10,25 +10,50 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   DEFAULT_UPLOAD_MAX_BYTES,
+  MAX_ATTACHMENTS_PER_MESSAGE,
+  base64DecodedLength,
   createZulipUploader,
-  loadAttachmentArg,
   guessMimeType,
-  resolveUploadMaxBytes,
+  isValidMimeType,
+  multipartBody,
+  parseUploadRoots,
+  prepareAttachmentArg,
+  prepareAttachments,
+  prepareBlocks,
+  resolveUploadPolicy,
+  sniffImageType,
   uploadAttachmentArgs,
-  uploadInputsFromBlocks,
+  uploadBlocks,
   withAttachmentLinks,
-  type UploadInput,
+  type UploadPolicy,
   type Uploader,
 } from '../src/uploads.ts';
 
 function tmp(): string {
-  return mkdtempSync(join(tmpdir(), 'zulip-uploads-'));
+  return realpathSync(mkdtempSync(join(tmpdir(), 'zulip-uploads-')));
 }
+
+function policy(over: Partial<UploadPolicy> = {}): UploadPolicy {
+  return { roots: new Map(), maxBytes: 1024, maxTotalBytes: 4096, maxCount: 10, ...over };
+}
+
+function fakeUploader() {
+  const uploaded: { name: string; bytes: string; mimeType?: string }[] = [];
+  const uploader: Uploader = {
+    async upload(i) {
+      uploaded.push({ name: i.name, bytes: i.data.toString(), mimeType: i.mimeType });
+      return { name: i.name, path: `/user_uploads/1/${i.name}`, url: `https://z/user_uploads/1/${i.name}` };
+    },
+  };
+  return { uploader, uploaded };
+}
+
+const b64 = (s: string) => Buffer.from(s).toString('base64');
 
 test('the uploader POSTs multipart to /api/v1/user_uploads with the bot auth and returns the upload path', async () => {
   let seen: { auth: string | undefined; contentType: string | undefined; body: string; url: string | undefined } | null = null;
@@ -60,7 +85,7 @@ test('the uploader POSTs multipart to /api/v1/user_uploads with the bot auth and
   }
 });
 
-test('the uploader surfaces Zulip errors, and accepts the newer `url` field', async () => {
+test('the uploader surfaces Zulip errors, and accepts both the `uri` and the newer `url` field', async () => {
   let mode: 'error' | 'url' = 'error';
   const server = createServer((req, res) => {
     req.resume();
@@ -94,50 +119,140 @@ test('an uploader without credentials refuses rather than sending an anonymous u
   assert.throws(() => createZulipUploader({ realm: '', authHeader: 'Basic x' }), /realm is unknown/);
 });
 
-test('loadAttachmentArg reads a local file (basename as the name) or decodes base64, and enforces the ceiling', async () => {
+test('the part header cannot be injected through the name or the type', () => {
+  const body = multipartBody({ name: 'a"\r\nX-Evil: 1\r\n\r\n.txt', data: Buffer.from('x'), mimeType: 'text/plain\r\nX-Evil: 1' }, 'B').toString();
+  assert.doesNotMatch(body, /^X-Evil/m, 'no injected header line');
+  assert.match(body, /filename="a___X-Evil: 1____.txt"/, 'quotes and line breaks in the name are neutralised');
+  assert.match(body, /Content-Type: application\/octet-stream/, 'an invalid type is not written into the header');
+  assert.equal(body.split('\r\n').length, 7, 'exactly the structural lines');
+  assert.equal(isValidMimeType('image/svg+xml'), true);
+  assert.equal(isValidMimeType('text/plain; charset=utf-8'), false);
+  assert.equal(isValidMimeType('text/plain\r\nX: 1'), false);
+  assert.equal(isValidMimeType('noslash'), false);
+});
+
+// ── Roots ──
+
+test('parseUploadRoots takes name=path entries, canonicalises them, and refuses what does not exist', () => {
   const dir = tmp();
   try {
-    const file = join(dir, 'notes.md');
-    writeFileSync(file, '# hi');
-    const fromFile = await loadAttachmentArg({ file }, 1024);
-    assert.equal(fromFile.name, 'notes.md');
-    assert.equal(fromFile.data.toString(), '# hi');
-    assert.equal(fromFile.mimeType, 'text/markdown', 'guessed from the extension');
-
-    const renamed = await loadAttachmentArg({ file, name: 'renamed.md', mime_type: 'text/markdown' }, 1024);
-    assert.equal(renamed.name, 'renamed.md');
-    assert.equal(renamed.mimeType, 'text/markdown');
-
-    const inline = await loadAttachmentArg({ data: Buffer.from('abc').toString('base64'), name: 'a.txt' }, 1024);
-    assert.equal(inline.data.toString(), 'abc');
-    assert.equal(inline.mimeType, 'text/plain');
-    assert.equal((await loadAttachmentArg({ data: 'aGk=', name: 'blob' }, 1024)).mimeType, undefined, 'no extension, no guess');
-    assert.equal((await loadAttachmentArg({ data: 'aGk=', name: 'x.weird' }, 1024)).mimeType, undefined);
-    assert.equal((await loadAttachmentArg({ data: 'aGk=', name: 'shot.PNG' }, 1024)).mimeType, 'image/png');
-
-    await assert.rejects(loadAttachmentArg({ file }, 2), /over the 2B upload ceiling/);
-    await assert.rejects(loadAttachmentArg({ data: Buffer.from('abc').toString('base64'), name: 'a' }, 2), /over the 2B upload ceiling/);
-    await assert.rejects(loadAttachmentArg({ file: join(dir, 'missing') }, 1024), /attachment ".*missing": ENOENT/);
-    await assert.rejects(loadAttachmentArg({ file: dir }, 1024), /not a regular file/);
-    await assert.rejects(loadAttachmentArg({ data: 'aGk=' }, 1024), /need a `name`/);
-    await assert.rejects(loadAttachmentArg({}, 1024), /exactly one of `file`/);
-    await assert.rejects(loadAttachmentArg({ file, data: 'aGk=' }, 1024), /exactly one of `file`/);
-    await assert.rejects(loadAttachmentArg('x' as never, 1024), /must be an object/);
+    mkdirSync(join(dir, 'notes'));
+    mkdirSync(join(dir, 'out'));
+    const roots = parseUploadRoots(' notes=./notes , out=' + join(dir, 'out') + ' ,', dir);
+    assert.deepEqual([...roots], [['notes', join(dir, 'notes')], ['out', join(dir, 'out')]]);
+    assert.equal(parseUploadRoots(undefined, dir).size, 0);
+    assert.equal(parseUploadRoots('', dir).size, 0);
+    assert.throws(() => parseUploadRoots('notes=./missing', dir), /root "notes" \(\.\/missing\): ENOENT/);
+    assert.throws(() => parseUploadRoots('./notes', dir), /is not name=path/);
+    assert.throws(() => parseUploadRoots('bad name=./notes', dir), /is not name=path/);
+    assert.throws(() => parseUploadRoots('notes=./notes,notes=./out', dir), /listed twice/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test('uploadAttachmentArgs validates every entry before uploading any', async () => {
-  const uploaded: string[] = [];
-  const uploader: Uploader = { async upload(i) { uploaded.push(i.name); return { name: i.name, path: `/user_uploads/1/${i.name}`, url: `https://z/user_uploads/1/${i.name}` }; } };
-  await assert.rejects(uploadAttachmentArgs(uploader, [{ data: 'aGk=', name: 'ok.txt' }, { data: 'aGk=' }], 1024), /need a `name`/);
-  assert.deepEqual(uploaded, []);
-  const out = await uploadAttachmentArgs(uploader, [{ data: 'aGk=', name: 'a.txt' }, { data: 'aGk=', name: 'b.txt' }], 1024);
-  assert.deepEqual(uploaded, ['a.txt', 'b.txt']);
-  assert.deepEqual(out.map((f) => f.path), ['/user_uploads/1/a.txt', '/user_uploads/1/b.txt']);
-  assert.deepEqual(await uploadAttachmentArgs(uploader, undefined, 1024), []);
-  await assert.rejects(uploadAttachmentArgs(uploader, 'nope', 1024), /must be an array/);
+test('with no roots, local files are refused outright; inline data still works', async () => {
+  await assert.rejects(prepareAttachmentArg({ file: 'notes/a.txt' }, policy()), /local-file attachments are disabled: no upload roots configured/);
+  await assert.rejects(prepareAttachmentArg({ file: '/etc/passwd' }, policy()), /no upload roots configured/);
+  const inline = await prepareAttachmentArg({ data: b64('hi'), name: 'a.txt' }, policy());
+  assert.equal((await inline.read()).toString(), 'hi');
+  // An empty array needs neither roots nor an uploader.
+  assert.deepEqual(await prepareAttachments([], policy()), []);
+});
+
+test('a local file is <root>/<path>, confined to the named root after symlink resolution', async () => {
+  const dir = tmp();
+  try {
+    const notes = join(dir, 'notes');
+    mkdirSync(join(notes, 'sub'), { recursive: true });
+    writeFileSync(join(notes, 'sub', 'report.md'), '# report');
+    writeFileSync(join(dir, 'secret.txt'), 'SECRET');
+    symlinkSync(join(dir, 'secret.txt'), join(notes, 'escape.txt'));
+    symlinkSync(join(notes, 'sub', 'report.md'), join(notes, 'alias.md'));
+    const p = policy({ roots: new Map([['notes', notes]]) });
+
+    const ok = await prepareAttachmentArg({ file: 'notes/sub/report.md' }, p);
+    assert.equal(ok.name, 'report.md');
+    assert.equal(ok.mimeType, 'text/markdown', 'guessed from the extension');
+    assert.equal(ok.size, 8);
+    assert.equal((await ok.read()).toString(), '# report');
+    await assert.rejects(ok.read(), /already read/);
+
+    const alias = await prepareAttachmentArg({ file: 'notes/alias.md', name: 'renamed.md', mime_type: 'text/x-markdown' }, p);
+    assert.equal(alias.name, 'renamed.md');
+    assert.equal(alias.mimeType, 'text/x-markdown');
+    assert.equal((await alias.read()).toString(), '# report', 'a symlink that stays inside the root is fine');
+
+    await assert.rejects(prepareAttachmentArg({ file: 'notes/escape.txt' }, p), /resolves outside upload root "notes"/);
+    await assert.rejects(prepareAttachmentArg({ file: 'notes/../secret.txt' }, p), /resolves outside upload root "notes"/);
+    await assert.rejects(prepareAttachmentArg({ file: join(notes, 'sub', 'report.md') }, p), /paths are root-relative/);
+    await assert.rejects(prepareAttachmentArg({ file: 'other/report.md' }, p), /unknown upload root "other"; available roots: notes/);
+    await assert.rejects(prepareAttachmentArg({ file: 'notes' }, p), /names a root, not a file/);
+    await assert.rejects(prepareAttachmentArg({ file: 'notes/sub' }, p), /not a regular file/);
+    await assert.rejects(prepareAttachmentArg({ file: 'notes/missing.md' }, p), /ENOENT/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the per-file ceiling is enforced on the bytes read, not only on stat', async () => {
+  const dir = tmp();
+  try {
+    const f = join(dir, 'grow.txt');
+    writeFileSync(f, 'x'.repeat(100));
+    const p = policy({ roots: new Map([['d', dir]]), maxBytes: 150 });
+    const prepared = await prepareAttachmentArg({ file: 'd/grow.txt' }, p);
+    writeFileSync(f, 'x'.repeat(400)); // grows between the size check and the read
+    await assert.rejects(prepared.read(), /grew past the 150B upload ceiling/);
+
+    writeFileSync(f, 'x'.repeat(151));
+    await assert.rejects(prepareAttachmentArg({ file: 'd/grow.txt' }, p), /is 151B, over the 150B upload ceiling/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('inline data is strict base64, measured before it is decoded', async () => {
+  const p = policy({ maxBytes: 8 });
+  assert.equal(base64DecodedLength('aGk='), 2);
+  assert.equal(base64DecodedLength('aGVsbG8='), 5);
+  assert.equal(base64DecodedLength(''), 0);
+  assert.throws(() => base64DecodedLength('data:image/png;base64,iVBOR'), /not valid base64/);
+  assert.throws(() => base64DecodedLength('!!!not base64!!!'), /not valid base64/);
+  assert.throws(() => base64DecodedLength('aGk'), /not valid base64/);
+
+  // Over the ceiling: rejected from the length arithmetic, nothing allocated.
+  await assert.rejects(prepareAttachmentArg({ data: b64('x'.repeat(9)), name: 'a.txt' }, p), /is 9B, over the 8B upload ceiling/);
+  await assert.rejects(prepareAttachmentArg({ data: 'aGk', name: 'a.txt' }, p), /attachment "a.txt": data is not valid base64/);
+  await assert.rejects(prepareAttachmentArg({ data: 'data:text/plain;base64,aGk=', name: 'a.txt' }, p), /not valid base64/);
+  await assert.rejects(prepareAttachmentArg({ data: '====', name: 'a.txt' }, p), /not valid base64/);
+  await assert.rejects(prepareAttachmentArg({ data: 'aGk=' }, p), /need a `name`/);
+  await assert.rejects(prepareAttachmentArg({}, p), /exactly one of `file`/);
+  await assert.rejects(prepareAttachmentArg({ file: 'd/a', data: 'aGk=' }, p), /exactly one of `file`/);
+  await assert.rejects(prepareAttachmentArg('x' as never, p), /must be an object/);
+  await assert.rejects(prepareAttachmentArg({ data: 'aGk=', name: 'a.txt', mime_type: 'text/plain\r\nX: 1' }, p), /mime_type must be type\/subtype/);
+
+  // Whitespace-wrapped base64 (as many encoders emit) is accepted.
+  const wrapped = await prepareAttachmentArg({ data: 'aGVs\nbG8=\n', name: 'a.txt' }, p);
+  assert.equal(wrapped.size, 5);
+  assert.equal((await wrapped.read()).toString(), 'hello');
+  assert.equal((await prepareAttachmentArg({ data: 'aGk=', name: 'blob' }, p)).mimeType, undefined, 'no extension, no guess');
+  assert.equal((await prepareAttachmentArg({ data: 'aGk=', name: 'shot.PNG' }, p)).mimeType, 'image/png');
+});
+
+test('count and aggregate budgets are checked before anything is uploaded', async () => {
+  const { uploader, uploaded } = fakeUploader();
+  const p = policy({ maxBytes: 100, maxTotalBytes: 250, maxCount: 3 });
+  const entry = (n: number) => ({ data: b64('x'.repeat(n)), name: `f${n}.txt` });
+  await assert.rejects(uploadAttachmentArgs(uploader, [entry(1), entry(2), entry(3), entry(4)], p), /at most 3 attachments per message \(got 4\)/);
+  await assert.rejects(uploadAttachmentArgs(uploader, [entry(100), entry(100), entry(51)], p), /total 251B, over the 250B per-message budget/);
+  await assert.rejects(uploadAttachmentArgs(uploader, [entry(1), { data: 'aGk=' }], p), /need a `name`/);
+  assert.deepEqual(uploaded, [], 'nothing reached the uploader');
+  const out = await uploadAttachmentArgs(uploader, [entry(100), entry(100), entry(50)], p);
+  assert.deepEqual(uploaded.map((u) => u.name), ['f100.txt', 'f100.txt', 'f50.txt']);
+  assert.deepEqual(out.map((f) => f.path), ['/user_uploads/1/f100.txt', '/user_uploads/1/f100.txt', '/user_uploads/1/f50.txt']);
+  assert.deepEqual(await uploadAttachmentArgs(uploader, undefined, p), []);
+  await assert.rejects(uploadAttachmentArgs(uploader, 'nope', p), /must be an array/);
 });
 
 test('withAttachmentLinks appends Zulip-style links, or is just the links when there is no text', () => {
@@ -150,34 +265,70 @@ test('withAttachmentLinks appends Zulip-style links, or is just the links when t
   assert.equal(withAttachmentLinks('plain', []), 'plain');
 });
 
-test('uploadInputsFromBlocks turns inline image/audio data and file:// resources into uploads, skipping text and remote URIs', async () => {
-  const dir = tmp();
-  try {
-    const file = join(dir, 'log file.txt');
-    writeFileSync(file, 'boom');
-    const inputs: UploadInput[] = await uploadInputsFromBlocks([
-      { type: 'text', text: 'hello' },
-      { type: 'image', data: Buffer.from('png!').toString('base64'), mimeType: 'image/png' },
-      { type: 'resource', uri: `file://${encodeURI(file)}` },
-      { type: 'resource', uri: 'https://example.com/x.pdf' },
-      { type: 'audio', data: Buffer.from('ogg!').toString('base64'), mimeType: 'audio/ogg' },
-      { type: 'image', uri: 'https://example.com/remote.png' },
-    ], 1024);
-    assert.deepEqual(inputs.map((i) => [i.name, i.data.toString(), i.mimeType]), [
-      ['image-2.png', 'png!', 'image/png'],
-      ['log file.txt', 'boom', 'text/plain'],
-      ['audio-5.ogg', 'ogg!', 'audio/ogg'],
-    ]);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+// ── Blocks ──
+
+const PNG_HEAD = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]);
+
+test('media blocks with inline data become uploads; URIs of any scheme and text are left alone', async () => {
+  const { uploader, uploaded } = fakeUploader();
+  const p = policy();
+  const out = await uploadBlocks(uploader, [
+    { type: 'text', text: 'hello' },
+    { type: 'image', data: b64('png!'), mimeType: 'image/png' },
+    { type: 'resource', uri: 'file:///etc/passwd' },
+    { type: 'resource', uri: 'https://example.com/x.pdf' },
+    { type: 'audio', data: b64('ogg!'), mimeType: 'audio/ogg' },
+    { type: 'image', uri: 'https://example.com/remote.png' },
+    { type: 'image', data: b64('svg'), mimeType: 'image/svg+xml' },
+  ], p);
+  assert.deepEqual(uploaded.map((u) => [u.name, u.bytes, u.mimeType]), [
+    ['image-2.png', 'png!', 'image/png'],
+    ['audio-5.ogg', 'ogg!', 'audio/ogg'],
+    ['image-7.svg', 'svg', 'image/svg+xml'],
+  ]);
+  assert.deepEqual(out.map((f) => f.path), ['/user_uploads/1/image-2.png', '/user_uploads/1/audio-5.ogg', '/user_uploads/1/image-7.svg']);
 });
 
-test('the upload ceiling comes from ZULIP_UPLOAD_MAX_BYTES, defaulting to Zulip Cloud\'s 25MiB', () => {
-  assert.equal(resolveUploadMaxBytes({}), DEFAULT_UPLOAD_MAX_BYTES);
-  assert.equal(resolveUploadMaxBytes({ ZULIP_UPLOAD_MAX_BYTES: '1000' }), 1000);
-  assert.equal(resolveUploadMaxBytes({ ZULIP_UPLOAD_MAX_BYTES: 'junk' }), DEFAULT_UPLOAD_MAX_BYTES);
-  assert.equal(resolveUploadMaxBytes({ ZULIP_UPLOAD_MAX_BYTES: '0' }), DEFAULT_UPLOAD_MAX_BYTES);
+test('an image block without a type is sniffed so it still previews; an invalid type is dropped, not injected', async () => {
+  const { uploader, uploaded } = fakeUploader();
+  await uploadBlocks(uploader, [
+    { type: 'image', data: PNG_HEAD.toString('base64') },
+    { type: 'image', data: b64('????'), mimeType: 'image/png\r\nX: 1' },
+    { type: 'audio', data: b64('????') },
+  ], policy());
+  assert.deepEqual(uploaded.map((u) => [u.name, u.mimeType]), [
+    ['image-1.png', 'image/png'],
+    ['image-2.bin', undefined],
+    ['audio-3.bin', undefined],
+  ]);
+  assert.equal(sniffImageType(Buffer.from([0xff, 0xd8, 0xff, 0xe0])), 'image/jpeg');
+  assert.equal(sniffImageType(Buffer.from('GIF89a......')), 'image/gif');
+  assert.equal(sniffImageType(Buffer.from('RIFF....WEBPVP8 ')), 'image/webp');
+  assert.equal(sniffImageType(Buffer.from('nope')), undefined);
+});
+
+test('block uploads honour the same ceilings and budgets', async () => {
+  const p = policy({ maxBytes: 4, maxTotalBytes: 6, maxCount: 2 });
+  await assert.rejects(prepareBlocks([{ type: 'image', data: b64('12345') }], p), /image block 1 is 5B, over the 4B upload ceiling/);
+  await assert.rejects(prepareBlocks([{ type: 'image', data: b64('1234') }, { type: 'image', data: b64('123') }], p), /total 7B, over the 6B per-message budget/);
+  await assert.rejects(prepareBlocks([{ type: 'image', data: b64('1') }, { type: 'image', data: b64('1') }, { type: 'image', data: b64('1') }], p), /at most 2 attachments/);
+  await assert.rejects(prepareBlocks([{ type: 'image', data: 'not base64!' }], p), /not valid base64/);
+  assert.deepEqual(await prepareBlocks([{ type: 'text', text: 'x' }], p), []);
+});
+
+// ── Policy ──
+
+test('the policy takes the per-file ceiling from the env, else the realm, else the Cloud default, and derives the budgets', () => {
+  const none = resolveUploadPolicy({}, null);
+  assert.equal(none.maxBytes, DEFAULT_UPLOAD_MAX_BYTES);
+  assert.equal(none.maxTotalBytes, DEFAULT_UPLOAD_MAX_BYTES * 4);
+  assert.equal(none.maxCount, MAX_ATTACHMENTS_PER_MESSAGE);
+  assert.equal(none.roots.size, 0);
+  assert.equal(resolveUploadPolicy({}, 80 * 1024 * 1024).maxBytes, 80 * 1024 * 1024, 'the realm advertises its cap');
+  assert.equal(resolveUploadPolicy({ ZULIP_UPLOAD_MAX_BYTES: '1000' }, 80 * 1024 * 1024).maxBytes, 1000, 'the env overrides it');
+  assert.equal(resolveUploadPolicy({ ZULIP_UPLOAD_MAX_BYTES: 'junk' }).maxBytes, DEFAULT_UPLOAD_MAX_BYTES);
+  assert.equal(resolveUploadPolicy({ ZULIP_UPLOAD_MAX_BYTES: '0' }).maxBytes, DEFAULT_UPLOAD_MAX_BYTES);
+  assert.throws(() => resolveUploadPolicy({ ZULIP_UPLOAD_ROOTS: 'x=/definitely/not/here' }), /ZULIP_UPLOAD_ROOTS: root "x"/);
 });
 
 test('guessMimeType covers the image types Zulip thumbnails, and nothing it does not know', () => {

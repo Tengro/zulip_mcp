@@ -122,7 +122,8 @@ test('publish uploads image blocks and links them after the text; without an upl
     { type: 'image' as const, data: Buffer.from('png').toString('base64'), mimeType: 'image/png' },
   ];
 
-  const withUploads = new ZulipAdapter(client, SELF, 's', { uploader });
+  const uploadPolicy = { roots: new Map<string, string>(), maxBytes: 1024, maxTotalBytes: 4096, maxCount: 10 };
+  const withUploads = new ZulipAdapter(client, SELF, 's', { uploader, uploadPolicy });
   const res = await withUploads.publish('zulip:general', undefined, blocks, { threadId: 'deploys' });
   assert.deepEqual(res, { delivered: true, messageId: '77', messageIds: ['77'] });
   assert.deepEqual(uploaded, ['image-2.png']);
@@ -133,7 +134,7 @@ test('publish uploads image blocks and links them after the text; without an upl
   assert.deepEqual(sends[1], { type: 'private', to: [42], content: '[image-1.png](/user_uploads/1/image-1.png)' });
 
   // A failed upload fails the publish before anything is sent.
-  const failing = new ZulipAdapter(client, SELF, 's', { uploader: { async upload() { throw new Error('quota'); } } });
+  const failing = new ZulipAdapter(client, SELF, 's', { uploader: { async upload() { throw new Error('quota'); } }, uploadPolicy });
   await assert.rejects(failing.publish('zulip:general', undefined, blocks), /quota/);
   assert.equal(sends.length, 2);
 

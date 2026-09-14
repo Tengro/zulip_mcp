@@ -7,20 +7,95 @@
  * Zulip attaches a file to a message by markdown link: the upload returns a
  * `/user_uploads/...` path and the message body links to it. Images so
  * linked get a preview in the web client automatically.
+ *
+ * Trust boundary. Tool input is influenced by message content from
+ * untrusted senders, and this server runs as a child of the host with the
+ * host's filesystem and environment. So a local-file attachment is never an
+ * arbitrary path: it is `<root>/<relative>`, where `<root>` names a
+ * directory an operator exported in `ZULIP_UPLOAD_ROOTS`. With no roots
+ * configured, local files are refused outright (fail closed); inline base64
+ * bytes still work. Every read is bounded by a per-file ceiling that is
+ * enforced on the bytes actually read, not only on `stat`, and a message
+ * carries at most `maxCount` files within `maxTotalBytes`.
  */
 
 import { randomBytes } from 'node:crypto';
-import { readFile, stat } from 'node:fs/promises';
-import { basename } from 'node:path';
+import { constants as fsConstants, type FileHandle, open, realpath } from 'node:fs/promises';
+import { realpathSync } from 'node:fs';
+import { basename, isAbsolute, resolve, sep } from 'node:path';
 import type { ContentBlock } from '@animalabs/mcpl-core';
 
-/** Zulip Cloud's default `MAX_FILE_UPLOAD_SIZE`. Self-hosted realms may differ; `ZULIP_UPLOAD_MAX_BYTES` overrides. */
-export const DEFAULT_UPLOAD_MAX_BYTES = 25 * 1024 * 1024;
+// ── Policy ──
 
-export function resolveUploadMaxBytes(env: NodeJS.ProcessEnv = process.env): number {
-  const n = Number(env.ZULIP_UPLOAD_MAX_BYTES ?? '');
-  return Number.isFinite(n) && n > 0 && env.ZULIP_UPLOAD_MAX_BYTES !== undefined ? Math.floor(n) : DEFAULT_UPLOAD_MAX_BYTES;
+/** Zulip Cloud's default `MAX_FILE_UPLOAD_SIZE`, used when the realm does not advertise its own. */
+export const DEFAULT_UPLOAD_MAX_BYTES = 25 * 1024 * 1024;
+/** Files per message. */
+export const MAX_ATTACHMENTS_PER_MESSAGE = 10;
+/** Aggregate bytes per message, as a multiple of the per-file ceiling. */
+export const TOTAL_BUDGET_MULTIPLIER = 4;
+
+export interface UploadPolicy {
+  /** Named roots for local-file attachments: name → canonical directory. Empty = local files refused. */
+  roots: ReadonlyMap<string, string>;
+  /** Per-file ceiling, bytes. */
+  maxBytes: number;
+  /** Per-message aggregate ceiling, bytes. */
+  maxTotalBytes: number;
+  /** Per-message file count ceiling. */
+  maxCount: number;
 }
+
+/**
+ * `ZULIP_UPLOAD_ROOTS=notes=./notes,output=/srv/agent/out` → name → canonical
+ * directory. Relative paths resolve against `cwd`. A root that does not
+ * exist or is not a directory is a configuration error (startup failure),
+ * never a silent skip: an operator who exported a root expects it to work.
+ */
+export function parseUploadRoots(spec: string | undefined, cwd: string = process.cwd()): Map<string, string> {
+  const roots = new Map<string, string>();
+  for (const raw of (spec ?? '').split(',')) {
+    const entry = raw.trim();
+    if (!entry) continue;
+    const eq = entry.indexOf('=');
+    const name = eq > 0 ? entry.slice(0, eq).trim() : '';
+    const dir = eq > 0 ? entry.slice(eq + 1).trim() : '';
+    if (!name || !dir || !/^[A-Za-z0-9_-]+$/.test(name)) {
+      throw new Error(`ZULIP_UPLOAD_ROOTS: entry "${entry}" is not name=path (name: letters, digits, _ or -)`);
+    }
+    if (roots.has(name)) throw new Error(`ZULIP_UPLOAD_ROOTS: root "${name}" is listed twice`);
+    let canonical: string;
+    try {
+      canonical = realpathSync(resolve(cwd, dir));
+    } catch (err) {
+      throw new Error(`ZULIP_UPLOAD_ROOTS: root "${name}" (${dir}): ${(err as Error).message}`);
+    }
+    roots.set(name, canonical);
+  }
+  return roots;
+}
+
+/**
+ * The policy from the environment. `realmMaxBytes` is what the realm
+ * advertises (`max_file_upload_size_mib`); `ZULIP_UPLOAD_MAX_BYTES` overrides
+ * it, and the Cloud default stands in when neither is known.
+ */
+export function resolveUploadPolicy(env: NodeJS.ProcessEnv = process.env, realmMaxBytes?: number | null): UploadPolicy {
+  const knob = Number(env.ZULIP_UPLOAD_MAX_BYTES ?? '');
+  const maxBytes =
+    env.ZULIP_UPLOAD_MAX_BYTES !== undefined && Number.isFinite(knob) && knob > 0
+      ? Math.floor(knob)
+      : realmMaxBytes && Number.isFinite(realmMaxBytes) && realmMaxBytes > 0
+        ? Math.floor(realmMaxBytes)
+        : DEFAULT_UPLOAD_MAX_BYTES;
+  return {
+    roots: parseUploadRoots(env.ZULIP_UPLOAD_ROOTS),
+    maxBytes,
+    maxTotalBytes: maxBytes * TOTAL_BUDGET_MULTIPLIER,
+    maxCount: MAX_ATTACHMENTS_PER_MESSAGE,
+  };
+}
+
+// ── Uploader ──
 
 export interface UploadInput {
   name: string;
@@ -47,18 +122,27 @@ export interface UploadTarget {
 
 type FetchLike = (url: string, init: { method: string; headers: Record<string, string>; body: Buffer }) => Promise<{ ok: boolean; status: number; json(): Promise<unknown> }>;
 
+/** RFC 2045 `type/subtype`, no parameters. Anything else cannot go into a part header. */
+const MIME_RE = /^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,126}\/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,126}$/;
+
+export function isValidMimeType(value: string): boolean {
+  return MIME_RE.test(value);
+}
+
 /**
  * A multipart/form-data body, built by hand. zulip-js drags in
  * isomorphic-form-data, which replaces the global `FormData` with a
  * stream-based one that cannot take a Blob — so neither the WHATWG form
  * nor that one is safe to rely on. A Buffer body works under every fetch.
+ * The header fields are re-sanitised here so no caller can inject a line.
  */
 export function multipartBody(input: UploadInput, boundary: string): Buffer {
   const name = input.name.replace(/["\r\n]/g, '_');
+  const type = input.mimeType && isValidMimeType(input.mimeType) ? input.mimeType : 'application/octet-stream';
   const head =
     `--${boundary}\r\n` +
     `Content-Disposition: form-data; name="file"; filename="${name}"\r\n` +
-    `Content-Type: ${input.mimeType || 'application/octet-stream'}\r\n\r\n`;
+    `Content-Type: ${type}\r\n\r\n`;
   return Buffer.concat([Buffer.from(head, 'utf8'), input.data, Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8')]);
 }
 
@@ -70,6 +154,9 @@ export function createZulipUploader(target: UploadTarget, fetchImpl: FetchLike =
     async upload(input: UploadInput): Promise<UploadedFile> {
       if (!target.authHeader) throw new Error('Cannot upload files: bot credentials are unknown (no email/api key)');
       const boundary = `----zulip-mcp-${randomBytes(12).toString('hex')}`;
+      // Single-request upload. Zulip's docs warn this endpoint may time out
+      // on bodies past ~25 MB; the resumable tus endpoint (feature level
+      // 296+) is the road there if a realm ever raises its cap that far.
       const res = await fetchImpl(`${realm}/api/v1/user_uploads`, {
         method: 'POST',
         headers: { Authorization: target.authHeader, 'Content-Type': `multipart/form-data; boundary=${boundary}` },
@@ -84,9 +171,9 @@ export function createZulipUploader(target: UploadTarget, fetchImpl: FetchLike =
       if (!res.ok || body.result !== 'success') {
         throw new Error(`upload of "${input.name}" failed: ${body.msg ?? `HTTP ${res.status}`}`);
       }
-      // Older servers return `uri`; feature level 285+ adds `url`. Either is
-      // the `/user_uploads/...` path.
-      const path = body.uri ?? body.url;
+      // Zulip 9.0 (feature level 272) renamed `uri` to `url`; older servers
+      // send only `uri`. Either is the `/user_uploads/...` path.
+      const path = body.url ?? body.uri;
       if (typeof path !== 'string' || !path.startsWith('/user_uploads/')) {
         throw new Error(`upload of "${input.name}" returned no usable path`);
       }
@@ -95,18 +182,7 @@ export function createZulipUploader(target: UploadTarget, fetchImpl: FetchLike =
   };
 }
 
-// ── Tool-argument form ──
-
-/** One entry of a tool's `attachments` argument: a local file or inline bytes. */
-export interface AttachmentArg {
-  /** Path of a local file readable by this server. */
-  file?: string;
-  /** Base64-encoded bytes (with `name`). */
-  data?: string;
-  /** Filename shown in Zulip; defaults to the local file's basename. */
-  name?: string;
-  mime_type?: string;
-}
+// ── MIME guessing ──
 
 /** Zulip only thumbnails (inline-previews) an upload whose declared type is
  *  `image/*`, and it does not sniff bytes or the filename: an image sent as
@@ -125,49 +201,225 @@ const MIME_BY_EXT: Record<string, string> = {
   pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
 };
 
+/** First extension listed for a type (`image/jpeg` → `jpg`). */
+const EXT_BY_MIME: Record<string, string> = {};
+for (const [ext, mime] of Object.entries(MIME_BY_EXT)) if (!(mime in EXT_BY_MIME)) EXT_BY_MIME[mime] = ext;
+
 export function guessMimeType(name: string): string | undefined {
   const ext = name.split('.').pop()?.toLowerCase() ?? '';
   return ext && ext !== name.toLowerCase() ? MIME_BY_EXT[ext] : undefined;
+}
+
+/** The image type from the leading bytes, for blocks that carry no type. */
+export function sniffImageType(data: Buffer): string | undefined {
+  if (data.length >= 8 && data.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return 'image/png';
+  if (data.length >= 3 && data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff) return 'image/jpeg';
+  if (data.length >= 6 && (data.subarray(0, 6).toString('latin1') === 'GIF87a' || data.subarray(0, 6).toString('latin1') === 'GIF89a')) return 'image/gif';
+  if (data.length >= 12 && data.subarray(0, 4).toString('latin1') === 'RIFF' && data.subarray(8, 12).toString('latin1') === 'WEBP') return 'image/webp';
+  return undefined;
+}
+
+function extensionFor(mimeType: string | undefined): string {
+  if (!mimeType) return 'bin';
+  const lower = mimeType.toLowerCase();
+  return EXT_BY_MIME[lower] ?? lower.split('/')[1]?.replace(/[^a-z0-9]/g, '').slice(0, 8) ?? 'bin';
+}
+
+// ── Preparing attachments (validate everything before reading anything) ──
+
+/** One entry of a tool's `attachments` argument: a local file or inline bytes. */
+export interface AttachmentArg {
+  /** `<root>/<path>` under a root named in ZULIP_UPLOAD_ROOTS. Never absolute. */
+  file?: string;
+  /** Base64-encoded bytes (with `name`). */
+  data?: string;
+  /** Filename shown in Zulip; defaults to the local file's basename. */
+  name?: string;
+  mime_type?: string;
+}
+
+/** A validated attachment whose bytes have not been read yet. */
+export interface PreparedUpload {
+  name: string;
+  mimeType?: string;
+  /** Declared size: the file's `fstat` size, or the base64's decoded length. */
+  size: number;
+  /** Read the bytes, bounded by the policy ceiling even if the source grew. */
+  read(): Promise<Buffer>;
 }
 
 function fmt(n: number): string {
   return n >= 1048576 ? `${(n / 1048576).toFixed(1)}MB` : n >= 1024 ? `${Math.round(n / 1024)}KB` : `${n}B`;
 }
 
-/** Resolve one attachment argument to bytes, enforcing the size ceiling before anything large is read. */
-export async function loadAttachmentArg(arg: AttachmentArg, maxBytes: number): Promise<UploadInput> {
+function mimeFromArg(arg: AttachmentArg, what: string): string | undefined {
+  if (arg.mime_type === undefined || arg.mime_type === null || arg.mime_type === '') return undefined;
+  if (typeof arg.mime_type !== 'string' || !isValidMimeType(arg.mime_type)) {
+    throw new Error(`attachment "${what}": mime_type must be type/subtype (got ${JSON.stringify(arg.mime_type)})`);
+  }
+  return arg.mime_type;
+}
+
+/** Resolve `<root>/<rest>` against the named root; the result is canonical and inside the root. */
+async function resolveUnderRoot(file: string, policy: UploadPolicy): Promise<string> {
+  if (policy.roots.size === 0) {
+    throw new Error(`local-file attachments are disabled: no upload roots configured (set ZULIP_UPLOAD_ROOTS=name=/dir,...); pass base64 \`data\` instead`);
+  }
+  const names = [...policy.roots.keys()].join(', ');
+  if (isAbsolute(file) || file.startsWith('\\') || /^[A-Za-z]:/.test(file)) {
+    throw new Error(`attachment "${file}": paths are root-relative (<root>/<path>); available roots: ${names}`);
+  }
+  const slash = file.indexOf('/');
+  const rootName = slash < 0 ? file : file.slice(0, slash);
+  const rest = slash < 0 ? '' : file.slice(slash + 1);
+  const rootDir = policy.roots.get(rootName);
+  if (!rootDir) throw new Error(`attachment "${file}": unknown upload root "${rootName}"; available roots: ${names}`);
+  if (!rest) throw new Error(`attachment "${file}": names a root, not a file in it`);
+  const outside = new Error(`attachment "${file}": resolves outside upload root "${rootName}"`);
+  // Lexically first (`..` segments), then canonically (symlinks).
+  const candidate = resolve(rootDir, rest);
+  if (candidate !== rootDir && !candidate.startsWith(rootDir + sep)) throw outside;
+  let canonical: string;
+  try {
+    canonical = await realpath(candidate);
+  } catch (err) {
+    throw new Error(`attachment "${file}": ${(err as Error).message}`);
+  }
+  if (canonical !== rootDir && !canonical.startsWith(rootDir + sep)) throw outside;
+  return canonical;
+}
+
+/** Read at most `maxBytes` (+1 to detect overflow), whatever `stat` claimed. */
+async function readCapped(handle: FileHandle, maxBytes: number): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  const chunk = Buffer.alloc(Math.min(64 * 1024, maxBytes + 1));
+  while (total <= maxBytes) {
+    const { bytesRead } = await handle.read(chunk, 0, Math.min(chunk.length, maxBytes + 1 - total), null);
+    if (bytesRead === 0) break;
+    chunks.push(Buffer.from(chunk.subarray(0, bytesRead)));
+    total += bytesRead;
+  }
+  return Buffer.concat(chunks);
+}
+
+async function prepareFile(arg: AttachmentArg, policy: UploadPolicy): Promise<PreparedUpload> {
+  const file = arg.file as string;
+  const canonical = await resolveUnderRoot(file, policy);
+  const name = (typeof arg.name === 'string' && arg.name.trim()) || basename(canonical);
+  const mimeType = mimeFromArg(arg, file) ?? guessMimeType(name);
+
+  // Open once, fstat that handle, and read from the same handle later: the
+  // size check and the read cannot be split by a rename. O_NOFOLLOW guards
+  // the final component against a symlink swapped in after realpath.
+  const handle = await open(canonical, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+  let size: number;
+  try {
+    const info = await handle.stat();
+    if (!info.isFile()) throw new Error(`attachment "${file}" is not a regular file`);
+    if (info.size > policy.maxBytes) throw new Error(`attachment "${file}" is ${fmt(info.size)}, over the ${fmt(policy.maxBytes)} upload ceiling`);
+    size = info.size;
+  } catch (err) {
+    await handle.close();
+    throw err;
+  }
+  let consumed = false;
+  return {
+    name,
+    mimeType,
+    size,
+    async read() {
+      if (consumed) throw new Error(`attachment "${file}" already read`);
+      consumed = true;
+      try {
+        const data = await readCapped(handle, policy.maxBytes);
+        if (data.length > policy.maxBytes) throw new Error(`attachment "${file}" grew past the ${fmt(policy.maxBytes)} upload ceiling`);
+        return data;
+      } finally {
+        await handle.close();
+      }
+    },
+  };
+}
+
+const BASE64_RE = /^[A-Za-z0-9+/]*={0,2}$/;
+
+/** Strict base64: alphabet, padding and length are checked, and the decoded size is known before decoding. */
+export function base64DecodedLength(text: string): number {
+  if (!BASE64_RE.test(text) || text.length % 4 !== 0) throw new Error('data is not valid base64');
+  const padding = text.endsWith('==') ? 2 : text.endsWith('=') ? 1 : 0;
+  return (text.length / 4) * 3 - padding;
+}
+
+function prepareInline(arg: AttachmentArg, policy: UploadPolicy): PreparedUpload {
+  const name = typeof arg.name === 'string' ? arg.name.trim() : '';
+  if (!name) throw new Error('inline attachments (`data`) need a `name`');
+  const text = (arg.data as string).replace(/\s+/g, '');
+  let size: number;
+  try {
+    size = base64DecodedLength(text);
+  } catch (err) {
+    throw new Error(`attachment "${name}": ${(err as Error).message}`);
+  }
+  if (size === 0) throw new Error(`attachment "${name}": data is empty`);
+  if (size > policy.maxBytes) throw new Error(`attachment "${name}" is ${fmt(size)}, over the ${fmt(policy.maxBytes)} upload ceiling`);
+  const mimeType = mimeFromArg(arg, name) ?? guessMimeType(name);
+  return {
+    name,
+    mimeType,
+    size,
+    async read() {
+      const data = Buffer.from(text, 'base64');
+      if (data.length !== size) throw new Error(`attachment "${name}": base64 decoded to an unexpected length`);
+      return data;
+    },
+  };
+}
+
+/** Validate one attachment argument. Nothing is read yet; the file is opened and measured. */
+export async function prepareAttachmentArg(arg: AttachmentArg, policy: UploadPolicy): Promise<PreparedUpload> {
   if (typeof arg !== 'object' || arg === null) throw new Error('each attachment must be an object with `file` or `data`');
   const hasFile = typeof arg.file === 'string' && arg.file.trim() !== '';
   const hasData = typeof arg.data === 'string' && arg.data !== '';
-  if (hasFile === hasData) throw new Error('each attachment needs exactly one of `file` (local path) or `data` (base64)');
-  const mimeType = typeof arg.mime_type === 'string' && arg.mime_type ? arg.mime_type : undefined;
-
-  if (hasFile) {
-    const file = arg.file as string;
-    const info = await stat(file).catch((err: Error) => { throw new Error(`attachment "${file}": ${err.message}`); });
-    if (!info.isFile()) throw new Error(`attachment "${file}" is not a regular file`);
-    if (info.size > maxBytes) throw new Error(`attachment "${file}" is ${fmt(info.size)}, over the ${fmt(maxBytes)} upload ceiling`);
-    const name = (typeof arg.name === 'string' && arg.name.trim()) || basename(file);
-    return { name, data: await readFile(file), mimeType: mimeType ?? guessMimeType(name) };
-  }
-
-  const name = typeof arg.name === 'string' ? arg.name.trim() : '';
-  if (!name) throw new Error('inline attachments (`data`) need a `name`');
-  const data = Buffer.from(arg.data as string, 'base64');
-  if (data.length === 0) throw new Error(`attachment "${name}": data is not valid base64`);
-  if (data.length > maxBytes) throw new Error(`attachment "${name}" is ${fmt(data.length)}, over the ${fmt(maxBytes)} upload ceiling`);
-  return { name, data, mimeType: mimeType ?? guessMimeType(name) };
+  if (hasFile === hasData) throw new Error('each attachment needs exactly one of `file` (root-relative path) or `data` (base64)');
+  return hasFile ? prepareFile(arg, policy) : prepareInline(arg, policy);
 }
 
-/** Validate and upload every attachment; all-or-nothing before any message is sent. */
-export async function uploadAttachmentArgs(uploader: Uploader, args: unknown, maxBytes: number): Promise<UploadedFile[]> {
+function checkBudget(prepared: PreparedUpload[], policy: UploadPolicy): void {
+  if (prepared.length > policy.maxCount) throw new Error(`at most ${policy.maxCount} attachments per message (got ${prepared.length})`);
+  const total = prepared.reduce((n, p) => n + p.size, 0);
+  if (total > policy.maxTotalBytes) throw new Error(`attachments total ${fmt(total)}, over the ${fmt(policy.maxTotalBytes)} per-message budget`);
+}
+
+/** Validate every entry of an `attachments` argument, and the count and aggregate size, before any byte is read. */
+export async function prepareAttachments(args: unknown, policy: UploadPolicy): Promise<PreparedUpload[]> {
   if (args === undefined || args === null) return [];
   if (!Array.isArray(args)) throw new Error('attachments must be an array');
-  const inputs: UploadInput[] = [];
-  for (const arg of args) inputs.push(await loadAttachmentArg(arg as AttachmentArg, maxBytes));
+  if (args.length > policy.maxCount) throw new Error(`at most ${policy.maxCount} attachments per message (got ${args.length})`);
+  const prepared: PreparedUpload[] = [];
+  try {
+    for (const arg of args) prepared.push(await prepareAttachmentArg(arg as AttachmentArg, policy));
+    checkBudget(prepared, policy);
+  } catch (err) {
+    // Release the file handles already opened.
+    await Promise.all(prepared.map((p) => p.read().catch(() => undefined)));
+    throw err;
+  }
+  return prepared;
+}
+
+/** Read and upload one at a time, so one file's bytes are in memory at once. */
+export async function uploadPrepared(uploader: Uploader, prepared: PreparedUpload[]): Promise<UploadedFile[]> {
   const out: UploadedFile[] = [];
-  for (const input of inputs) out.push(await uploader.upload(input));
+  for (const p of prepared) out.push(await uploader.upload({ name: p.name, mimeType: p.mimeType, data: await p.read() }));
   return out;
+}
+
+/** Validate all, then upload. Uploads happen before the send; a send that
+ *  then fails leaves them unreferenced, and Zulip garbage-collects unclaimed
+ *  uploads after a week. */
+export async function uploadAttachmentArgs(uploader: Uploader, args: unknown, policy: UploadPolicy): Promise<UploadedFile[]> {
+  return uploadPrepared(uploader, await prepareAttachments(args, policy));
 }
 
 /** The markdown Zulip uses to attach an upload to a message. */
@@ -185,42 +437,48 @@ export function withAttachmentLinks(content: string, files: UploadedFile[]): str
 
 // ── MCPL content blocks ──
 
-const EXT_FOR_MIME: Record<string, string> = {
-  'image/png': 'png',
-  'image/jpeg': 'jpg',
-  'image/gif': 'gif',
-  'image/webp': 'webp',
-  'audio/mpeg': 'mp3',
-  'audio/wav': 'wav',
-  'audio/ogg': 'ogg',
-};
-
-function nameFor(kind: string, mimeType: string | undefined, index: number): string {
-  const ext = (mimeType && EXT_FOR_MIME[mimeType.toLowerCase()]) || (mimeType?.split('/')[1] ?? 'bin');
-  return `${kind}-${index + 1}.${ext}`;
+/**
+ * The media blocks of a publish, validated as uploads: `image`/`audio`
+ * blocks carrying inline data. URI-bearing blocks are left alone — Zulip
+ * can only attach bytes this server holds, and a host→server `file://`
+ * reference has no meaning in the spec (and would be a path the host chose
+ * for the server's filesystem). Count and byte budgets apply as for tools.
+ */
+export async function prepareBlocks(blocks: ContentBlock[], policy: UploadPolicy): Promise<PreparedUpload[]> {
+  const prepared: PreparedUpload[] = [];
+  for (const [i, block] of blocks.entries()) {
+    if ((block.type !== 'image' && block.type !== 'audio') || typeof block.data !== 'string') continue;
+    const text = block.data.replace(/\s+/g, '');
+    const size = base64DecodedLength(text);
+    if (size === 0) continue;
+    if (size > policy.maxBytes) throw new Error(`${block.type} block ${i + 1} is ${fmt(size)}, over the ${fmt(policy.maxBytes)} upload ceiling`);
+    const declared = typeof block.mimeType === 'string' && isValidMimeType(block.mimeType) ? block.mimeType : undefined;
+    const kind = block.type;
+    prepared.push({
+      name: `${kind}-${i + 1}.${extensionFor(declared)}`,
+      mimeType: declared,
+      size,
+      async read() {
+        return Buffer.from(text, 'base64');
+      },
+    });
+  }
+  checkBudget(prepared, policy);
+  return prepared;
 }
 
-/**
- * The non-text blocks of a publish, as upload inputs: inline `image`/`audio`
- * data, and `file://` URIs on any block (read from disk). Other URIs are
- * left to the caller — Zulip can only attach bytes this server holds.
- */
-export async function uploadInputsFromBlocks(blocks: ContentBlock[], maxBytes: number): Promise<UploadInput[]> {
-  const inputs: UploadInput[] = [];
-  for (const [i, block] of blocks.entries()) {
-    if (block.type === 'text') continue;
-    const uri = 'uri' in block && typeof block.uri === 'string' ? block.uri : undefined;
-    if (uri !== undefined) {
-      if (!uri.startsWith('file://')) continue;
-      const file = decodeURIComponent(new URL(uri).pathname);
-      const mime = 'mimeType' in block && typeof block.mimeType === 'string' ? block.mimeType : undefined;
-      inputs.push(await loadAttachmentArg({ file, mime_type: mime }, maxBytes));
-      continue;
+/** Upload the media blocks; an image with no declared type is sniffed so it still previews. */
+export async function uploadBlocks(uploader: Uploader, blocks: ContentBlock[], policy: UploadPolicy): Promise<UploadedFile[]> {
+  const out: UploadedFile[] = [];
+  for (const p of await prepareBlocks(blocks, policy)) {
+    const data = await p.read();
+    let mimeType = p.mimeType;
+    let name = p.name;
+    if (!mimeType && name.startsWith('image-')) {
+      mimeType = sniffImageType(data);
+      if (mimeType) name = name.replace(/\.bin$/, `.${extensionFor(mimeType)}`);
     }
-    if ((block.type === 'image' || block.type === 'audio') && typeof block.data === 'string') {
-      const mimeType = block.mimeType;
-      inputs.push(await loadAttachmentArg({ data: block.data, name: nameFor(block.type, mimeType, i), mime_type: mimeType }, maxBytes));
-    }
+    out.push(await uploader.upload({ name, mimeType, data }));
   }
-  return inputs;
+  return out;
 }

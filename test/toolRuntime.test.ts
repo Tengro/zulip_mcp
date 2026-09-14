@@ -8,11 +8,12 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ZulipToolRuntime, stripSuppressedReactions } from '../src/tool-runtime.ts';
 import type { ZulipSession } from '../src/zulip-client.ts';
+import type { UploadPolicy } from '../src/uploads.ts';
 
 function runtime(client: Record<string, unknown>): { tools: ZulipToolRuntime; dir: string } {
   const dir = mkdtempSync(join(tmpdir(), 'zulip-tools-'));
@@ -112,13 +113,14 @@ function fakeUploader() {
   return { uploader, uploaded };
 }
 
-function runtimeWithUploads(client: Record<string, unknown>, uploader: { upload: (i: any) => Promise<any> }) {
+function runtimeWithUploads(client: Record<string, unknown>, uploader: { upload: (i: any) => Promise<any> }, roots = new Map<string, string>()) {
   const dir = mkdtempSync(join(tmpdir(), 'zulip-tools-'));
   const session: ZulipSession = { client, selfUserId: 790, realm: 'https://z.example.com', authHeader: 'Basic x', sessionId: 't' };
+  const uploadPolicy: UploadPolicy = { roots, maxBytes: 1024, maxTotalBytes: 4096, maxCount: 10 };
   const original = console.error;
   console.error = () => {};
   try {
-    return { tools: new ZulipToolRuntime(session, dir, { uploader, uploadMaxBytes: 1024 }), dir };
+    return { tools: new ZulipToolRuntime(session, dir, { uploader, uploadPolicy }), dir };
   } finally {
     console.error = original;
   }
@@ -177,6 +179,27 @@ test('send_dm resolves recipients, then uploads, then sends with the links; uplo
   }
 });
 
+test('upload_file and the send tools read local files only through a configured root', async () => {
+  const sends: Record<string, unknown>[] = [];
+  const client = { messages: { async send(p: Record<string, unknown>) { sends.push(p); return { result: 'success', id: 3 }; } } };
+  const { uploader, uploaded } = fakeUploader();
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'zulip-root-')));
+  writeFileSync(join(root, 'chart.png'), 'PNG');
+  const { tools, dir } = runtimeWithUploads(client, uploader, new Map([['out', root]]));
+  try {
+    const up = await tools.handleToolCall('upload_file', { file: 'out/chart.png' });
+    assert.equal(up.markdown, '[chart.png](/user_uploads/1/ab/chart.png)');
+    assert.deepEqual(uploaded[0], { name: 'chart.png', bytes: 'PNG', mimeType: 'image/png' });
+    await assert.rejects(tools.handleToolCall('upload_file', { file: join(root, 'chart.png') }), /paths are root-relative/);
+    await assert.rejects(tools.handleToolCall('upload_file', { file: 'out/../chart.png' }), /outside upload root/);
+    await assert.rejects(tools.handleToolCall('send_message', { type: 'stream', to: 'g', topic: 't', attachments: [{ file: 'home/.zuliprc' }] }), /unknown upload root "home"/);
+    assert.equal(sends.length, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('without a realm there is no uploader: attachments error clearly and plain sends still work', async () => {
   const sends: Record<string, unknown>[] = [];
   const client = { messages: { async send(p: Record<string, unknown>) { sends.push(p); return { result: 'success', id: 1 }; } } };
@@ -189,7 +212,8 @@ test('without a realm there is no uploader: attachments error clearly and plain 
   try {
     await assert.rejects(tools.handleToolCall('send_message', { type: 'stream', to: 'g', topic: 't', attachments: [{ data: 'aGk=', name: 'a' }] }), /need the realm URL and bot credentials/);
     await tools.handleToolCall('send_message', { type: 'stream', to: 'g', topic: 't', content: 'ok' });
-    assert.equal(sends.length, 1);
+    await tools.handleToolCall('send_message', { type: 'stream', to: 'g', topic: 't', content: 'ok', attachments: [] });
+    assert.equal(sends.length, 2, 'an empty attachments array needs no uploader');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

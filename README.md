@@ -89,7 +89,8 @@ are likely to touch:
 | `ZULIP_MISSED_BLOCK_MAX_CHARS` | 40000 | Size cap on one `<missed>` block; the oldest lines are elided with a `fetch_history` pointer |
 | `ZULIP_BACKSCROLL_DEFAULT`, `ZULIP_BACKSCROLL_CHANNELS` | 500 | History cap on `channels/open`, per stream as `general:50,dev:200` |
 | `ZULIP_INLINE_IMAGES`, `ZULIP_INLINE_IMAGES_MAX`, `ZULIP_ATTACHMENT_INLINE_MAX_BYTES` | true, 4, 5120 | Attachment inlining on live delivery |
-| `ZULIP_UPLOAD_MAX_BYTES` | 25 MiB | Per-file ceiling for outbound uploads (`attachments`, `upload_file`); match the realm's `MAX_FILE_UPLOAD_SIZE` |
+| `ZULIP_UPLOAD_ROOTS` | — | Named directories local-file attachments may come from, `notes=./notes,out=/srv/out`. Unset: local files refused, base64 only |
+| `ZULIP_UPLOAD_MAX_BYTES` | realm's cap, else 25 MiB | Per-file ceiling for outbound uploads; the realm's `max_file_upload_size_mib` is read at start. A message carries at most 10 files within 4× this |
 | `AGENT_TIMEZONE`, `AGENT_TIMESTAMP_STYLE` | system, `full` | Agent-visible timestamps in catch-up blocks |
 | `MCPL_ENABLED` | true | `false` forces plain-MCP mode even for MCPL hosts |
 
@@ -215,15 +216,37 @@ file, or remove it to re-seed from the environment.
 `edit_message`, `delete_message`, `add_reaction`, `remove_reaction`.
 
 Both send tools take an optional `attachments` array; each entry is a local
-file (`{ "file": "/path/report.pdf" }`) or inline bytes
+file (`{ "file": "notes/report.pdf" }`) or inline bytes
 (`{ "data": "<base64>", "name": "chart.png" }`), with an optional
-`mime_type`. Files are uploaded to the realm first and linked at the end of
-the message, the way the Zulip client attaches them, so images get a preview.
-`content` may be omitted when there are attachments. `upload_file` does the
-upload alone and returns the `/user_uploads/...` path, the URL, and the
-markdown link, for embedding in an `edit_message` or anywhere in a body.
-On the MCPL publish path, `image` and `audio` blocks with inline data and
-`resource` blocks with `file://` URIs are uploaded the same way.
+`mime_type` (guessed from the extension otherwise; Zulip previews an image
+only when its declared type is `image/*`). Files are uploaded to the realm
+first and linked at the end of the message, the way the Zulip client
+attaches them. `content` may be omitted when there are attachments.
+`upload_file` does the upload alone and returns the `/user_uploads/...`
+path, the URL, and the markdown link, for embedding in an `edit_message` or
+anywhere in a body. On the MCPL publish path, `image` and `audio` blocks
+with inline data are uploaded the same way. Uploads happen before the send;
+a send that then fails leaves them unreferenced, and Zulip garbage-collects
+unclaimed uploads after a week.
+
+**Local files are confined to upload roots.** Tool input is influenced by
+message content from untrusted senders, and this server runs with the
+host's filesystem and environment, so a `file` is never an arbitrary path.
+It is `<root>/<path>`, where `<root>` names a directory exported in
+`ZULIP_UPLOAD_ROOTS` (`notes=./notes,out=/srv/agent/out`; relative to the
+server's cwd, which under a host is the host's). The path is resolved
+against that root, symlinks followed, and must land inside it; absolute
+paths and other roots are refused with the available names in the error.
+With no roots configured, local-file attachments are refused and only
+base64 `data` works. A root that does not exist is a startup failure. To
+let an agent attach what it writes in its workspace, mount the workspace
+and name it as a root at the same path, e.g. `ZULIP_UPLOAD_ROOTS=workspace=./workspace`,
+so the mount-prefixed path the agent already knows is the attachment path.
+
+Limits: one file up to the realm's advertised cap (or `ZULIP_UPLOAD_MAX_BYTES`),
+at most 10 files per message, 4× the per-file cap in total. The per-file
+ceiling is enforced on the bytes read, not only on `stat`, and base64 is
+measured before it is decoded.
 
 **Attention**
 `listen` / `unlisten` (Zulip stream subscription), `start_monitoring` /

@@ -178,13 +178,14 @@ export const toolDefinitions: ToolDefinition[] = [
         attachments: {
           type: "array",
           description:
-            "Files to attach. Each entry is either { file: '/local/path' } (a file readable by this server; the basename becomes the filename) " +
-            "or { data: '<base64>', name: 'report.pdf' }. Optional mime_type on either. Files are uploaded to Zulip first, " +
-            "then linked at the end of the message (images get a preview). With attachments, content may be empty.",
+            "Files to attach (max 10). Each entry is either { file: '<root>/<path>' } — a file under one of the server's configured " +
+            "upload roots, e.g. 'notes/report.pdf'; absolute paths are refused and with no roots configured local files are unavailable — " +
+            "or { data: '<base64>', name: 'report.pdf' }. Optional mime_type on either (guessed from the extension otherwise). " +
+            "Files are uploaded to Zulip first, then linked at the end of the message (images get a preview). With attachments, content may be empty.",
           items: {
             type: "object",
             properties: {
-              file: { type: "string", description: "Local file path" },
+              file: { type: "string", description: "Root-relative path: <root>/<path> under a configured upload root" },
               data: { type: "string", description: "Base64-encoded bytes (requires name)" },
               name: { type: "string", description: "Filename shown in Zulip" },
               mime_type: { type: "string", description: "MIME type (optional)" },
@@ -214,12 +215,12 @@ export const toolDefinitions: ToolDefinition[] = [
         attachments: {
           type: "array",
           description:
-            "Files to attach: { file: '/local/path' } or { data: '<base64>', name: 'x.pdf' } each, optional mime_type. " +
-            "Uploaded first, then linked at the end of the message.",
+            "Files to attach (max 10): { file: '<root>/<path>' } (under a configured upload root, e.g. 'notes/report.pdf') " +
+            "or { data: '<base64>', name: 'x.pdf' } each, optional mime_type. Uploaded first, then linked at the end of the message.",
           items: {
             type: "object",
             properties: {
-              file: { type: "string", description: "Local file path" },
+              file: { type: "string", description: "Root-relative path: <root>/<path> under a configured upload root" },
               data: { type: "string", description: "Base64-encoded bytes (requires name)" },
               name: { type: "string", description: "Filename shown in Zulip" },
               mime_type: { type: "string", description: "MIME type (optional)" },
@@ -239,7 +240,7 @@ export const toolDefinitions: ToolDefinition[] = [
     inputSchema: {
       type: "object",
       properties: {
-        file: { type: "string", description: "Local file path readable by this server" },
+        file: { type: "string", description: "Root-relative path: <root>/<path> under a configured upload root (never absolute)" },
         data: { type: "string", description: "Base64-encoded bytes (alternative to file; requires name)" },
         name: { type: "string", description: "Filename shown in Zulip (defaults to the file's basename)" },
         mime_type: { type: "string", description: "MIME type (optional)" },

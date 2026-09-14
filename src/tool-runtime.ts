@@ -23,10 +23,12 @@ import { chunkMessage } from "./content.js";
 import {
   attachmentMarkdown,
   createZulipUploader,
-  loadAttachmentArg,
-  resolveUploadMaxBytes,
-  uploadAttachmentArgs,
+  prepareAttachmentArg,
+  prepareAttachments,
+  resolveUploadPolicy,
+  uploadPrepared,
   withAttachmentLinks,
+  type UploadPolicy,
   type Uploader,
 } from "./uploads.js";
 
@@ -207,25 +209,30 @@ export class ZulipToolRuntime {
   onSent: ((sent: SentRecord) => void) | null = null;
 
   private readonly uploader: Uploader | null;
-  private readonly uploadMaxBytes: number;
+  private readonly uploadPolicy: UploadPolicy;
 
   constructor(
     private readonly session: ZulipSession,
     private readonly stateDir: string = STATE_DIR,
-    options: { uploader?: Uploader; uploadMaxBytes?: number } = {},
+    options: { uploader?: Uploader; uploadPolicy?: UploadPolicy } = {},
   ) {
     this.zulipClient = session.client;
     this.sessionId = session.sessionId;
     this.uploader = options.uploader ?? (session.realm ? createZulipUploader(session) : null);
-    this.uploadMaxBytes = options.uploadMaxBytes ?? resolveUploadMaxBytes();
+    this.uploadPolicy = options.uploadPolicy ?? resolveUploadPolicy(process.env, session.maxUploadBytes);
     this.loadState();
   }
 
-  /** Upload every `attachments` entry of a send call; throws before anything is sent. */
-  private async uploadFor(args: Record<string, any>) {
-    if (args.attachments === undefined || args.attachments === null) return [];
+  private requireUploader(): Uploader {
     if (!this.uploader) throw new Error("file uploads need the realm URL and bot credentials (ZULIP_REALM + ZULIP_EMAIL/ZULIP_API_KEY, or a zuliprc)");
-    return uploadAttachmentArgs(this.uploader, args.attachments, this.uploadMaxBytes);
+    return this.uploader;
+  }
+
+  /** Validate and upload every `attachments` entry of a send call; throws before anything is sent. */
+  private async uploadFor(args: Record<string, any>) {
+    const prepared = await prepareAttachments(args.attachments, this.uploadPolicy);
+    if (prepared.length === 0) return [];
+    return uploadPrepared(this.requireUploader(), prepared);
   }
 
   /** Reaction suppression for history rendering (the filters plane). */
@@ -627,10 +634,10 @@ export class ZulipToolRuntime {
       }
 
       case "upload_file": {
-        if (!this.uploader) throw new Error("file uploads need the realm URL and bot credentials (ZULIP_REALM + ZULIP_EMAIL/ZULIP_API_KEY, or a zuliprc)");
-        const input = await loadAttachmentArg({ file: args.file, data: args.data, name: args.name, mime_type: args.mime_type }, this.uploadMaxBytes);
-        const file = await this.uploader.upload(input);
-        return { ...file, size: input.data.length, markdown: attachmentMarkdown(file) };
+        const prepared = await prepareAttachmentArg({ file: args.file, data: args.data, name: args.name, mime_type: args.mime_type }, this.uploadPolicy);
+        const data = await prepared.read();
+        const file = await this.requireUploader().upload({ name: prepared.name, mimeType: prepared.mimeType, data });
+        return { ...file, size: data.length, markdown: attachmentMarkdown(file) };
       }
 
       case "edit_message": {
