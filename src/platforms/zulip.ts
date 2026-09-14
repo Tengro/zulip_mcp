@@ -32,6 +32,7 @@ import type {
 } from './adapter.js';
 import { ZulipEventLoop } from './zulip-events.js';
 import { chunkMessage } from '../content.js';
+import { uploadBlocks, withAttachmentLinks, type UploadPolicy, type Uploader } from '../uploads.js';
 import {
   assertApiSuccess,
   channelIdOf,
@@ -98,6 +99,10 @@ export interface ZulipAdapterOptions {
   dmDiscoveryLimit?: number;
   /** The realm's max message length; longer publishes are split. */
   maxMessageLength?: number;
+  /** Uploads for the media blocks of a publish (image/audio with inline data). Unset: such blocks are dropped. */
+  uploader?: Uploader;
+  /** Size and count limits for those uploads. Required with `uploader`. */
+  uploadPolicy?: UploadPolicy;
 }
 
 export const DEFAULT_BACKSCROLL = 500;
@@ -113,6 +118,8 @@ export class ZulipAdapter implements PlatformAdapter {
   private readonly filters: FilterView;
   private readonly dmDiscoveryLimit: number;
   private readonly maxMessageLength: number | undefined;
+  private readonly uploader: Uploader | null;
+  private readonly uploadPolicy: UploadPolicy | null;
   /** DM conversations already described to the server, by channel id. */
   private knownDms = new Map<string, ChannelDescriptor>();
   /** Recently seen messages, so a reaction can be placed without a round
@@ -132,6 +139,9 @@ export class ZulipAdapter implements PlatformAdapter {
     this.filters = options.filters ?? ALLOW_ALL;
     this.dmDiscoveryLimit = options.dmDiscoveryLimit ?? DEFAULT_DM_DISCOVERY_LIMIT;
     this.maxMessageLength = options.maxMessageLength;
+    this.uploader = options.uploader ?? null;
+    this.uploadPolicy = options.uploadPolicy ?? null;
+    if (this.uploader && !this.uploadPolicy) throw new Error('ZulipAdapter: uploader needs an uploadPolicy');
   }
 
   /** The history cap for a stream (descriptor `capabilities.history.maxMessages`). */
@@ -250,10 +260,18 @@ export class ZulipAdapter implements PlatformAdapter {
     content: ContentBlock[],
     hints?: RoutingHints,
   ): Promise<PublishResult> {
-    const textContent = content
+    let textContent = content
       .filter((c): c is TextContent => c.type === 'text')
       .map(c => c.text)
       .join('\n');
+    // Image and audio blocks ride along as uploads, linked after the text
+    // (Zulip's own attachment form). Uploads happen before the send, so a
+    // failed upload fails the publish whole; a send that fails after them
+    // leaves unreferenced uploads, which Zulip garbage-collects.
+    if (this.uploader && this.uploadPolicy) {
+      const uploaded = await uploadBlocks(this.uploader, content, this.uploadPolicy);
+      textContent = withAttachmentLinks(textContent, uploaded);
+    }
     if (!textContent) return { delivered: false };
 
     const dmIds = parseDmChannelId(channelId);

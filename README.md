@@ -89,6 +89,8 @@ are likely to touch:
 | `ZULIP_MISSED_BLOCK_MAX_CHARS` | 40000 | Size cap on one `<missed>` block; the oldest lines are elided with a `fetch_history` pointer |
 | `ZULIP_BACKSCROLL_DEFAULT`, `ZULIP_BACKSCROLL_CHANNELS` | 500 | History cap on `channels/open`, per stream as `general:50,dev:200` |
 | `ZULIP_INLINE_IMAGES`, `ZULIP_INLINE_IMAGES_MAX`, `ZULIP_ATTACHMENT_INLINE_MAX_BYTES` | true, 4, 5120 | Attachment inlining on live delivery |
+| `ZULIP_UPLOAD_ROOTS` | — | Named directories local-file attachments may come from, `notes=./notes,out=/srv/out`. Unset: local files refused, base64 only |
+| `ZULIP_UPLOAD_MAX_BYTES` | realm's cap, else 25 MiB | Per-file ceiling for outbound uploads; the realm's `max_file_upload_size_mib` is read at start. A message carries at most 10 files within 4× this |
 | `AGENT_TIMEZONE`, `AGENT_TIMESTAMP_STYLE` | system, `full` | Agent-visible timestamps in catch-up blocks |
 | `MCPL_ENABLED` | true | `false` forces plain-MCP mode even for MCPL hosts |
 
@@ -210,8 +212,56 @@ file, or remove it to re-seed from the environment.
 `get_user_profile`, `fetch_attachment`, `list_emojis`.
 
 **Writing**
-`send_message`, `send_dm` (by name, email, or id), `edit_message`,
-`delete_message`, `add_reaction`, `remove_reaction`.
+`send_message`, `send_dm` (by name, email, or id), `upload_file`,
+`edit_message`, `delete_message`, `add_reaction`, `remove_reaction`.
+
+Both send tools take an optional `attachments` array; each entry is a local
+file (`{ "file": "notes/report.pdf" }`) or inline bytes
+(`{ "data": "<base64>", "name": "chart.png" }`), with an optional
+`mime_type` (guessed from the extension otherwise; Zulip previews an image
+only when its declared type is `image/*`). Files are uploaded to the realm
+first and linked at the end of the message, the way the Zulip client
+attaches them. `content` may be omitted when there are attachments.
+`upload_file` does the upload alone and returns the `/user_uploads/...`
+path, the URL, and the markdown link, for embedding in an `edit_message` or
+anywhere in a body. On the MCPL publish path, `image` and `audio` blocks
+with inline data are uploaded the same way. Uploads happen before the send;
+a send that then fails leaves them unreferenced, and Zulip garbage-collects
+unclaimed uploads after a week.
+
+**Local files are confined to upload roots.** Tool input is influenced by
+message content from untrusted senders, and this server runs with the
+host's filesystem and environment, so a `file` is never an arbitrary path.
+It is `<root>/<path>`, where `<root>` names a directory exported in
+`ZULIP_UPLOAD_ROOTS` (`notes=./notes,out=/srv/agent/out`; relative to the
+server's cwd, which under a host is the host's). The path is resolved
+against that root, symlinks followed, and must land inside it; absolute
+paths and other roots are refused with the available names in the error.
+With no roots configured, local-file attachments are refused and only
+base64 `data` works. A root that does not exist is a startup failure. To
+let an agent attach what it writes in its workspace, mount the workspace
+and name it as a root at the same path, e.g. `ZULIP_UPLOAD_ROOTS=workspace=./workspace`,
+so the mount-prefixed path the agent already knows is the attachment path.
+The check is bound to the file actually opened, not to its pathname (via
+`/proc/self/fd`), so a directory swapped for a symlink mid-request is
+caught too. That makes local-file attachments Linux-only: on other
+platforms Node has no descriptor-relative resolution, a pathname re-check
+would be the very race the guard exists for, and so `file` is refused
+there with a pointer to base64 `data`. What the check cannot see is a hard
+link created inside a root to a file outside it: that needs
+a local writer in the root (and, with `fs.protected_hardlinks=1`, ownership
+of the target), so export roots only writers you trust can reach.
+
+Limits: one file up to the realm's advertised cap (or `ZULIP_UPLOAD_MAX_BYTES`),
+at most 10 files per message, 4× the per-file cap in total. The per-file
+ceiling is enforced on the bytes read, not only on `stat`; the aggregate
+budget is checked on declared sizes before any read and again on the bytes
+actually read; base64 is measured before it is decoded. Files are read and
+uploaded one at a time, so peak memory is one file in three copies (the
+bytes, the multipart body, and the copy Node's fetch makes of the request
+body). On the MCPL publish path a media block with malformed base64 fails
+the publish; blocks the server cannot upload (no uploader, or a URI) are
+dropped as before.
 
 **Attention**
 `listen` / `unlisten` (Zulip stream subscription), `start_monitoring` /

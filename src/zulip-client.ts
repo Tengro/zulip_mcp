@@ -17,6 +17,8 @@ export interface ZulipSession {
   authHeader: string;
   /** Persistent-state id (ZULIP_SESSION_ID, else the bot email, else 'default'). */
   sessionId: string;
+  /** The realm's advertised per-file upload cap (`max_file_upload_size_mib`), bytes; null when unknown. */
+  maxUploadBytes?: number | null;
 }
 
 export async function initializeZulipClient(env: NodeJS.ProcessEnv = process.env): Promise<ZulipSession> {
@@ -98,6 +100,17 @@ export async function initializeZulipClient(env: NodeJS.ProcessEnv = process.env
     console.error("Failed to fetch bot profile for self-filter:", err);
   }
 
+  // The realm's upload cap, so the outbound ceiling is what the server will
+  // actually accept rather than a guess. Fail-open: unknown → null.
+  let maxUploadBytes: number | null = null;
+  try {
+    const settings = await client.callEndpoint("server_settings", "GET", {});
+    const mib = settings?.max_file_upload_size_mib;
+    if (typeof mib === "number" && Number.isFinite(mib) && mib > 0) maxUploadBytes = Math.floor(mib * 1024 * 1024);
+  } catch (err) {
+    console.error("Failed to read realm server settings (upload cap):", err);
+  }
+
   // Auto-subscribe to streams named in ZULIP_SUBSCRIBE (comma-separated).
   // Needed because Zulip's event queue only delivers message events for streams
   // the bot is subscribed to, even with all_public_streams: true on the queue.
@@ -118,5 +131,5 @@ export async function initializeZulipClient(env: NodeJS.ProcessEnv = process.env
   }
 
   console.error(`Zulip MCP initialized with session: ${sessionId}`);
-  return { client, selfUserId, realm, authHeader, sessionId };
+  return { client, selfUserId, realm, authHeader, sessionId, maxUploadBytes };
 }

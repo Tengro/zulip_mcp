@@ -405,6 +405,9 @@ test('a degraded grant is reported as such and disables the tools of the feature
   // A messaging tool is unavailable with its feature set; a plain lookup is not.
   const send = (await h.host.sendRequest('tools/call', { name: 'send_message', arguments: {} })) as { isError?: boolean };
   assert.equal(send.isError, true);
+  const upload = (await h.host.sendRequest('tools/call', { name: 'upload_file', arguments: { data: 'aGk=', name: 'a.txt' } })) as { isError?: boolean; content: { text: string }[] };
+  assert.equal(upload.isError, true, 'upload_file is a messaging tool and goes with the feature set');
+  assert.match(upload.content[0].text, /zulip.messaging/);
   const list = (await h.host.sendRequest('tools/call', { name: 'list_streams', arguments: {} })) as { isError?: boolean };
   assert.notEqual(list.isError, true);
   await h.close();

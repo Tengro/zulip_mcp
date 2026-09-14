@@ -28,6 +28,10 @@
  *   ZULIP_INLINE_IMAGES                         - "false" to stop inlining images on live delivery
  *   ZULIP_INLINE_IMAGES_MAX                     - images inlined per message (4)
  *   ZULIP_ATTACHMENT_INLINE_MAX_BYTES           - text attachments inlined at or under this size (5120; max 256KiB)
+ *   ZULIP_UPLOAD_ROOTS                          - named directories local-file attachments may come from,
+ *                                                 "notes=./notes,out=/srv/out"; unset = local files refused
+ *   ZULIP_UPLOAD_MAX_BYTES                      - per-file ceiling for outbound uploads (the realm's
+ *                                                 advertised cap, else 25MiB); 10 files / 4x that per message
  *   MCPL_ENABLED                                - "false" forces plain-MCP mode
  *   MCPL_BATCH_WINDOW_MS                        - channels/incoming batching window (500)
  *   MCPL_CONTEXT_HISTORY_SIZE                   - messages injected per open channel (20)
@@ -45,6 +49,7 @@ import { DEFAULT_BACKSCROLL, ZulipAdapter } from './platforms/zulip.js';
 import { DEFAULT_CATCHUP_LIMIT, ZulipMcplServer } from './server.js';
 import { DEFAULT_MISSED_BLOCK_MAX_CHARS } from './delivery.js';
 import { ZulipToolRuntime } from './tool-runtime.js';
+import { LOCAL_FILES_SUPPORTED, createZulipUploader, resolveUploadPolicy } from './uploads.js';
 import { initializeZulipClient } from './zulip-client.js';
 
 export { fetchAttachmentBytes, extractZulipAttachments, cleanContent } from './content.js';
@@ -95,13 +100,22 @@ async function main(): Promise<void> {
   const stateDir = process.env.ZULIP_STATE_DIR || join(homedir(), '.zulip_mcp_state');
   const filters = new FiltersPlane(process.env.ZULIP_FILTERS_FILE || join(stateDir, `${session.sessionId}.filters.json`));
   filters.start();
+  // Outbound uploads: a bad ZULIP_UPLOAD_ROOTS is a startup failure.
+  const uploadPolicy = resolveUploadPolicy(process.env, session.maxUploadBytes);
+  const uploader = session.realm ? createZulipUploader(session) : undefined;
+  if (uploadPolicy.roots.size > 0) {
+    console.error(`[zulip-mcp] upload roots: ${[...uploadPolicy.roots].map(([n, d]) => `${n}=${d}`).join(', ')}`);
+    if (!LOCAL_FILES_SUPPORTED) console.error(`[zulip-mcp] ZULIP_UPLOAD_ROOTS is set but local-file attachments are Linux-only on this platform (${process.platform}); base64 data still works`);
+  }
   const adapter = new ZulipAdapter(session.client, session.selfUserId, session.sessionId, {
+    uploader,
+    uploadPolicy,
     backscrollDefault: intEnv('ZULIP_BACKSCROLL_DEFAULT', DEFAULT_BACKSCROLL),
     backscrollLimits: parseBackscrollLimits(process.env.ZULIP_BACKSCROLL_CHANNELS),
     filters,
     maxMessageLength: process.env.ZULIP_MAX_MESSAGE_LENGTH ? intEnv('ZULIP_MAX_MESSAGE_LENGTH', 10000) : undefined,
   });
-  const tools = new ZulipToolRuntime(session, stateDir);
+  const tools = new ZulipToolRuntime(session, stateDir, { uploader, uploadPolicy });
   tools.setReactionPolicy({
     suppressed: (name, code, type) => filters.reactionSuppressed(name, code, type),
   });
