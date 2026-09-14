@@ -89,6 +89,7 @@ are likely to touch:
 | `ZULIP_MISSED_BLOCK_MAX_CHARS` | 40000 | Size cap on one `<missed>` block; the oldest lines are elided with a `fetch_history` pointer |
 | `ZULIP_BACKSCROLL_DEFAULT`, `ZULIP_BACKSCROLL_CHANNELS` | 500 | History cap on `channels/open`, per stream as `general:50,dev:200` |
 | `ZULIP_INLINE_IMAGES`, `ZULIP_INLINE_IMAGES_MAX`, `ZULIP_ATTACHMENT_INLINE_MAX_BYTES` | true, 4, 5120 | Attachment inlining on live delivery |
+| `ZULIP_UPLOAD_MAX_BYTES` | 25 MiB | Per-file ceiling for outbound uploads (`attachments`, `upload_file`); match the realm's `MAX_FILE_UPLOAD_SIZE` |
 | `AGENT_TIMEZONE`, `AGENT_TIMESTAMP_STYLE` | system, `full` | Agent-visible timestamps in catch-up blocks |
 | `MCPL_ENABLED` | true | `false` forces plain-MCP mode even for MCPL hosts |
 
@@ -210,8 +211,19 @@ file, or remove it to re-seed from the environment.
 `get_user_profile`, `fetch_attachment`, `list_emojis`.
 
 **Writing**
-`send_message`, `send_dm` (by name, email, or id), `edit_message`,
-`delete_message`, `add_reaction`, `remove_reaction`.
+`send_message`, `send_dm` (by name, email, or id), `upload_file`,
+`edit_message`, `delete_message`, `add_reaction`, `remove_reaction`.
+
+Both send tools take an optional `attachments` array; each entry is a local
+file (`{ "file": "/path/report.pdf" }`) or inline bytes
+(`{ "data": "<base64>", "name": "chart.png" }`), with an optional
+`mime_type`. Files are uploaded to the realm first and linked at the end of
+the message, the way the Zulip client attaches them, so images get a preview.
+`content` may be omitted when there are attachments. `upload_file` does the
+upload alone and returns the `/user_uploads/...` path, the URL, and the
+markdown link, for embedding in an `edit_message` or anywhere in a body.
+On the MCPL publish path, `image` and `audio` blocks with inline data and
+`resource` blocks with `file://` URIs are uploaded the same way.
 
 **Attention**
 `listen` / `unlisten` (Zulip stream subscription), `start_monitoring` /

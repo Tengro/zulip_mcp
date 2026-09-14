@@ -106,3 +106,39 @@ test('ensureSubscribed asks Zulip every time — a subscription dropped by unlis
   await adapter.ensureSubscribed('zulip:dm:42');
   assert.equal(calls.subscribe.length, 2, 'DMs need nothing');
 });
+
+test('publish uploads image blocks and links them after the text; without an uploader they are dropped as before', async () => {
+  const sends: Record<string, unknown>[] = [];
+  const client = { messages: { async send(p: Record<string, unknown>) { sends.push(p); return { result: 'success', id: 77 }; } } };
+  const uploaded: string[] = [];
+  const uploader = {
+    async upload(i: { name: string; data: Buffer }) {
+      uploaded.push(i.name);
+      return { name: i.name, path: `/user_uploads/1/${i.name}`, url: `https://z/user_uploads/1/${i.name}` };
+    },
+  };
+  const blocks = [
+    { type: 'text' as const, text: 'chart attached' },
+    { type: 'image' as const, data: Buffer.from('png').toString('base64'), mimeType: 'image/png' },
+  ];
+
+  const withUploads = new ZulipAdapter(client, SELF, 's', { uploader });
+  const res = await withUploads.publish('zulip:general', undefined, blocks, { threadId: 'deploys' });
+  assert.deepEqual(res, { delivered: true, messageId: '77', messageIds: ['77'] });
+  assert.deepEqual(uploaded, ['image-2.png']);
+  assert.deepEqual(sends[0], { type: 'stream', to: 'general', topic: 'deploys', content: 'chart attached\n\n[image-2.png](/user_uploads/1/image-2.png)' });
+
+  // Only an image: the links are the body.
+  await withUploads.publish('zulip:dm:42', undefined, [blocks[1]]);
+  assert.deepEqual(sends[1], { type: 'private', to: [42], content: '[image-1.png](/user_uploads/1/image-1.png)' });
+
+  // A failed upload fails the publish before anything is sent.
+  const failing = new ZulipAdapter(client, SELF, 's', { uploader: { async upload() { throw new Error('quota'); } } });
+  await assert.rejects(failing.publish('zulip:general', undefined, blocks), /quota/);
+  assert.equal(sends.length, 2);
+
+  const plain = new ZulipAdapter(client, SELF, 's');
+  await plain.publish('zulip:general', undefined, blocks);
+  assert.equal(sends[2].content, 'chart attached');
+  assert.equal((await plain.publish('zulip:general', undefined, [blocks[1]])).delivered, false);
+});

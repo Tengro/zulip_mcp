@@ -20,6 +20,15 @@ import {
 import type { ZulipSession } from "./zulip-client.js";
 import { assertApiSuccess, dmChannelIdFor, fetchAround, fetchHistory, parseDmChannelId, renderReactions, type ReactionSummary, type ZulipMessage } from "./history.js";
 import { chunkMessage } from "./content.js";
+import {
+  attachmentMarkdown,
+  createZulipUploader,
+  loadAttachmentArg,
+  resolveUploadMaxBytes,
+  uploadAttachmentArgs,
+  withAttachmentLinks,
+  type Uploader,
+} from "./uploads.js";
 
 /** A message this server sent through a tool — recorded for rollback. */
 export interface SentRecord {
@@ -197,13 +206,26 @@ export class ZulipToolRuntime {
    *  so a rollback checkpoint can undo it. */
   onSent: ((sent: SentRecord) => void) | null = null;
 
+  private readonly uploader: Uploader | null;
+  private readonly uploadMaxBytes: number;
+
   constructor(
     private readonly session: ZulipSession,
     private readonly stateDir: string = STATE_DIR,
+    options: { uploader?: Uploader; uploadMaxBytes?: number } = {},
   ) {
     this.zulipClient = session.client;
     this.sessionId = session.sessionId;
+    this.uploader = options.uploader ?? (session.realm ? createZulipUploader(session) : null);
+    this.uploadMaxBytes = options.uploadMaxBytes ?? resolveUploadMaxBytes();
     this.loadState();
+  }
+
+  /** Upload every `attachments` entry of a send call; throws before anything is sent. */
+  private async uploadFor(args: Record<string, any>) {
+    if (args.attachments === undefined || args.attachments === null) return [];
+    if (!this.uploader) throw new Error("file uploads need the realm URL and bot credentials (ZULIP_REALM + ZULIP_EMAIL/ZULIP_API_KEY, or a zuliprc)");
+    return uploadAttachmentArgs(this.uploader, args.attachments, this.uploadMaxBytes);
   }
 
   /** Reaction suppression for history rendering (the filters plane). */
@@ -555,36 +577,60 @@ export class ZulipToolRuntime {
       }
 
       case "send_message": {
-        if (typeof args.content !== "string" || !args.content.trim()) throw new Error("content is required");
+        const hasText = typeof args.content === "string" && args.content.trim() !== "";
+        const hasFiles = Array.isArray(args.attachments) && args.attachments.length > 0;
+        if (!hasText && !hasFiles) throw new Error("content is required (or at least one attachment)");
+        const uploaded = await this.uploadFor(args);
+        const content = withAttachmentLinks(hasText ? args.content : "", uploaded);
         const ids: number[] = [];
         let last: any = null;
         const channelId = args.type === "private" && Array.isArray(args.to) && args.to.every((t: unknown) => typeof t === "number")
           ? dmChannelIdFor(args.to as number[])
           : `zulip:${Array.isArray(args.to) ? args.to.join(",") : String(args.to ?? "")}`;
-        for (const chunk of chunkMessage(args.content)) {
+        for (const chunk of chunkMessage(content)) {
           last = await zulipClient.messages.send({ type: args.type, to: args.to, topic: args.topic, content: chunk });
           if (last?.result === "error") throw new Error(last.msg ?? "Zulip refused the message");
           ids.push(last.id);
           this.onSent?.({ messageId: String(last.id), channelId, content: chunk });
         }
-        return ids.length > 1 ? { ...last, ids, note: `Sent as ${ids.length} messages (content exceeded the realm's message length).` } : last;
+        return {
+          ...last,
+          ...(uploaded.length > 0 ? { attachments: uploaded } : {}),
+          ...(ids.length > 1 ? { ids, note: `Sent as ${ids.length} messages (content exceeded the realm's message length).` } : {}),
+        };
       }
 
       case "send_dm": {
         const wanted: string[] = Array.isArray(args.to) ? args.to.map(String) : [String(args.to ?? "")];
         if (wanted.length === 0 || wanted.some((w) => !w.trim())) throw new Error("to must name at least one recipient");
-        if (typeof args.content !== "string" || !args.content.trim()) throw new Error("content is required");
+        const hasText = typeof args.content === "string" && args.content.trim() !== "";
+        const hasFiles = Array.isArray(args.attachments) && args.attachments.length > 0;
+        if (!hasText && !hasFiles) throw new Error("content is required (or at least one attachment)");
         const ids = await Promise.all(wanted.map((w) => this.resolveUserId(w)));
+        const uploaded = await this.uploadFor(args);
+        const content = withAttachmentLinks(hasText ? args.content : "", uploaded);
         const channelId = dmChannelIdFor(ids);
         const sent: number[] = [];
         let result: any = null;
-        for (const chunk of chunkMessage(args.content)) {
+        for (const chunk of chunkMessage(content)) {
           result = await zulipClient.messages.send({ type: "private", to: ids, content: chunk });
           if (result?.result === "error") throw new Error(result.msg ?? "Zulip refused the message");
           sent.push(result.id);
           this.onSent?.({ messageId: String(result.id), channelId, content: chunk });
         }
-        return { ...result, to_user_ids: ids, ...(sent.length > 1 ? { ids: sent, note: `Sent as ${sent.length} messages.` } : {}) };
+        return {
+          ...result,
+          to_user_ids: ids,
+          ...(uploaded.length > 0 ? { attachments: uploaded } : {}),
+          ...(sent.length > 1 ? { ids: sent, note: `Sent as ${sent.length} messages.` } : {}),
+        };
+      }
+
+      case "upload_file": {
+        if (!this.uploader) throw new Error("file uploads need the realm URL and bot credentials (ZULIP_REALM + ZULIP_EMAIL/ZULIP_API_KEY, or a zuliprc)");
+        const input = await loadAttachmentArg({ file: args.file, data: args.data, name: args.name, mime_type: args.mime_type }, this.uploadMaxBytes);
+        const file = await this.uploader.upload(input);
+        return { ...file, size: input.data.length, markdown: attachmentMarkdown(file) };
       }
 
       case "edit_message": {
