@@ -211,6 +211,8 @@ test('without a realm there is no uploader: attachments error clearly and plain 
   console.error = original;
   try {
     await assert.rejects(tools.handleToolCall('send_message', { type: 'stream', to: 'g', topic: 't', attachments: [{ data: 'aGk=', name: 'a' }] }), /need the realm URL and bot credentials/);
+    await assert.rejects(tools.handleToolCall('send_message', { type: 'stream', to: 'g', topic: 't', attachments: [{ file: 'x/y' }] }), /need the realm URL/, 'the uploader is checked before any file is touched');
+    await assert.rejects(tools.handleToolCall('upload_file', { file: 'x/y' }), /need the realm URL/);
     await tools.handleToolCall('send_message', { type: 'stream', to: 'g', topic: 't', content: 'ok' });
     await tools.handleToolCall('send_message', { type: 'stream', to: 'g', topic: 't', content: 'ok', attachments: [] });
     assert.equal(sends.length, 2, 'an empty attachments array needs no uploader');

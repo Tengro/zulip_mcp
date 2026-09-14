@@ -154,7 +154,7 @@ export const toolDefinitions: ToolDefinition[] = [
     name: "send_message",
     description:
       "Send a message to a stream or as a direct message. For streams, provide 'stream' and 'topic'. For DMs, provide 'to' as user email(s). " +
-      "Pass 'attachments' to send files (local paths or base64) with the message.",
+      "Pass 'attachments' to send files (root-relative paths under a configured upload root, or base64) with the message.",
     inputSchema: {
       type: "object",
       properties: {

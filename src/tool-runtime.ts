@@ -230,9 +230,10 @@ export class ZulipToolRuntime {
 
   /** Validate and upload every `attachments` entry of a send call; throws before anything is sent. */
   private async uploadFor(args: Record<string, any>) {
-    const prepared = await prepareAttachments(args.attachments, this.uploadPolicy);
-    if (prepared.length === 0) return [];
-    return uploadPrepared(this.requireUploader(), prepared);
+    if (args.attachments === undefined || args.attachments === null) return [];
+    if (Array.isArray(args.attachments) && args.attachments.length === 0) return [];
+    const uploader = this.requireUploader();
+    return uploadPrepared(uploader, await prepareAttachments(args.attachments, this.uploadPolicy), this.uploadPolicy);
   }
 
   /** Reaction suppression for history rendering (the filters plane). */
@@ -634,10 +635,15 @@ export class ZulipToolRuntime {
       }
 
       case "upload_file": {
+        const uploader = this.requireUploader();
         const prepared = await prepareAttachmentArg({ file: args.file, data: args.data, name: args.name, mime_type: args.mime_type }, this.uploadPolicy);
-        const data = await prepared.read();
-        const file = await this.requireUploader().upload({ name: prepared.name, mimeType: prepared.mimeType, data });
-        return { ...file, size: data.length, markdown: attachmentMarkdown(file) };
+        try {
+          const data = await prepared.read();
+          const file = await uploader.upload({ name: prepared.name, mimeType: prepared.mimeType, data });
+          return { ...file, size: data.length, markdown: attachmentMarkdown(file) };
+        } finally {
+          await prepared.close();
+        }
       }
 
       case "edit_message": {

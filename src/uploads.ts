@@ -20,7 +20,7 @@
  */
 
 import { randomBytes } from 'node:crypto';
-import { constants as fsConstants, type FileHandle, open, realpath } from 'node:fs/promises';
+import { constants as fsConstants, type FileHandle, open, readlink, realpath, stat } from 'node:fs/promises';
 import { realpathSync } from 'node:fs';
 import { basename, isAbsolute, resolve, sep } from 'node:path';
 import type { ContentBlock } from '@animalabs/mcpl-core';
@@ -138,7 +138,7 @@ export function isValidMimeType(value: string): boolean {
  */
 export function multipartBody(input: UploadInput, boundary: string): Buffer {
   const name = input.name.replace(/["\r\n]/g, '_');
-  const type = input.mimeType && isValidMimeType(input.mimeType) ? input.mimeType : 'application/octet-stream';
+  const type = bareMimeType(input.mimeType) ?? 'application/octet-stream';
   const head =
     `--${boundary}\r\n` +
     `Content-Disposition: form-data; name="file"; filename="${name}"\r\n` +
@@ -244,24 +244,48 @@ export interface PreparedUpload {
   mimeType?: string;
   /** Declared size: the file's `fstat` size, or the base64's decoded length. */
   size: number;
-  /** Read the bytes, bounded by the policy ceiling even if the source grew. */
+  /** Read the bytes, bounded by the policy ceiling even if the source grew. Closes the source. */
   read(): Promise<Buffer>;
+  /** Release the source without reading it. Idempotent; a no-op after `read()`. */
+  close(): Promise<void>;
 }
 
 function fmt(n: number): string {
   return n >= 1048576 ? `${(n / 1048576).toFixed(1)}MB` : n >= 1024 ? `${Math.round(n / 1024)}KB` : `${n}B`;
 }
 
+/** `type/subtype; param=…` → `type/subtype`; undefined when that is not a valid type. */
+export function bareMimeType(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const bare = value.split(';')[0].trim();
+  return isValidMimeType(bare) ? bare : undefined;
+}
+
 function mimeFromArg(arg: AttachmentArg, what: string): string | undefined {
   if (arg.mime_type === undefined || arg.mime_type === null || arg.mime_type === '') return undefined;
-  if (typeof arg.mime_type !== 'string' || !isValidMimeType(arg.mime_type)) {
-    throw new Error(`attachment "${what}": mime_type must be type/subtype (got ${JSON.stringify(arg.mime_type)})`);
-  }
-  return arg.mime_type;
+  const bare = bareMimeType(arg.mime_type);
+  if (!bare) throw new Error(`attachment "${what}": mime_type must be type/subtype (got ${JSON.stringify(arg.mime_type)})`);
+  return bare;
+}
+
+function inside(path: string, rootDir: string): boolean {
+  return path === rootDir || path.startsWith(rootDir + sep);
+}
+
+/** A filesystem failure without the host path the error carried. */
+function fsFailure(file: string, err: unknown): Error {
+  const code = (err as NodeJS.ErrnoException)?.code;
+  const why =
+    code === 'ENOENT' || code === 'ENOTDIR' ? 'not found'
+      : code === 'EACCES' || code === 'EPERM' ? 'permission denied'
+        : code === 'ELOOP' ? 'too many symbolic links'
+          : code === 'EISDIR' ? 'is a directory'
+            : `cannot be read${code ? ` (${code})` : ''}`;
+  return new Error(`attachment "${file}": ${why}`);
 }
 
 /** Resolve `<root>/<rest>` against the named root; the result is canonical and inside the root. */
-async function resolveUnderRoot(file: string, policy: UploadPolicy): Promise<string> {
+async function resolveUnderRoot(file: string, policy: UploadPolicy): Promise<{ canonical: string; rootDir: string; rootName: string }> {
   if (policy.roots.size === 0) {
     throw new Error(`local-file attachments are disabled: no upload roots configured (set ZULIP_UPLOAD_ROOTS=name=/dir,...); pass base64 \`data\` instead`);
   }
@@ -278,15 +302,34 @@ async function resolveUnderRoot(file: string, policy: UploadPolicy): Promise<str
   const outside = new Error(`attachment "${file}": resolves outside upload root "${rootName}"`);
   // Lexically first (`..` segments), then canonically (symlinks).
   const candidate = resolve(rootDir, rest);
-  if (candidate !== rootDir && !candidate.startsWith(rootDir + sep)) throw outside;
+  if (!inside(candidate, rootDir)) throw outside;
   let canonical: string;
   try {
     canonical = await realpath(candidate);
   } catch (err) {
-    throw new Error(`attachment "${file}": ${(err as Error).message}`);
+    throw fsFailure(file, err);
   }
-  if (canonical !== rootDir && !canonical.startsWith(rootDir + sep)) throw outside;
-  return canonical;
+  if (!inside(canonical, rootDir)) throw outside;
+  return { canonical, rootDir, rootName };
+}
+
+/**
+ * Bind the containment check to the object actually opened, not to the
+ * pathname it was opened by: a parent directory swapped for a symlink
+ * between `realpath` and `open` would otherwise open a file outside the
+ * root (O_NOFOLLOW guards only the final component). Linux tells us what
+ * the descriptor refers to; elsewhere the opened inode must be the inode
+ * at the (re-verified) canonical path.
+ */
+export async function verifyOpenedInsideRoot(handle: FileHandle, canonical: string, rootDir: string): Promise<boolean> {
+  if (process.platform === 'linux') {
+    const actual = (await readlink(`/proc/self/fd/${handle.fd}`)).replace(/ \(deleted\)$/, '');
+    return inside(actual, rootDir);
+  }
+  const now = await realpath(canonical);
+  if (!inside(now, rootDir)) return false;
+  const [opened, at] = await Promise.all([handle.stat(), stat(now)]);
+  return opened.dev === at.dev && opened.ino === at.ino;
 }
 
 /** Read at most `maxBytes` (+1 to detect overflow), whatever `stat` claimed. */
@@ -305,16 +348,25 @@ async function readCapped(handle: FileHandle, maxBytes: number): Promise<Buffer>
 
 async function prepareFile(arg: AttachmentArg, policy: UploadPolicy): Promise<PreparedUpload> {
   const file = arg.file as string;
-  const canonical = await resolveUnderRoot(file, policy);
+  const { canonical, rootDir, rootName } = await resolveUnderRoot(file, policy);
   const name = (typeof arg.name === 'string' && arg.name.trim()) || basename(canonical);
   const mimeType = mimeFromArg(arg, file) ?? guessMimeType(name);
 
   // Open once, fstat that handle, and read from the same handle later: the
   // size check and the read cannot be split by a rename. O_NOFOLLOW guards
-  // the final component against a symlink swapped in after realpath.
-  const handle = await open(canonical, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+  // the final component against a symlink swapped in after realpath;
+  // verifyOpenedInsideRoot guards the rest of the path.
+  let handle: FileHandle;
+  try {
+    handle = await open(canonical, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+  } catch (err) {
+    throw fsFailure(file, err);
+  }
   let size: number;
   try {
+    if (!(await verifyOpenedInsideRoot(handle, canonical, rootDir))) {
+      throw new Error(`attachment "${file}": resolves outside upload root "${rootName}"`);
+    }
     const info = await handle.stat();
     if (!info.isFile()) throw new Error(`attachment "${file}" is not a regular file`);
     if (info.size > policy.maxBytes) throw new Error(`attachment "${file}" is ${fmt(info.size)}, over the ${fmt(policy.maxBytes)} upload ceiling`);
@@ -323,22 +375,27 @@ async function prepareFile(arg: AttachmentArg, policy: UploadPolicy): Promise<Pr
     await handle.close();
     throw err;
   }
-  let consumed = false;
+  let done = false;
+  const close = async () => {
+    if (done) return;
+    done = true;
+    await handle.close();
+  };
   return {
     name,
     mimeType,
     size,
     async read() {
-      if (consumed) throw new Error(`attachment "${file}" already read`);
-      consumed = true;
+      if (done) throw new Error(`attachment "${file}" already read or released`);
       try {
         const data = await readCapped(handle, policy.maxBytes);
         if (data.length > policy.maxBytes) throw new Error(`attachment "${file}" grew past the ${fmt(policy.maxBytes)} upload ceiling`);
         return data;
       } finally {
-        await handle.close();
+        await close();
       }
     },
+    close,
   };
 }
 
@@ -373,6 +430,7 @@ function prepareInline(arg: AttachmentArg, policy: UploadPolicy): PreparedUpload
       if (data.length !== size) throw new Error(`attachment "${name}": base64 decoded to an unexpected length`);
       return data;
     },
+    async close() {},
   };
 }
 
@@ -401,17 +459,36 @@ export async function prepareAttachments(args: unknown, policy: UploadPolicy): P
     for (const arg of args) prepared.push(await prepareAttachmentArg(arg as AttachmentArg, policy));
     checkBudget(prepared, policy);
   } catch (err) {
-    // Release the file handles already opened.
-    await Promise.all(prepared.map((p) => p.read().catch(() => undefined)));
+    await closeAll(prepared);
     throw err;
   }
   return prepared;
 }
 
-/** Read and upload one at a time, so one file's bytes are in memory at once. */
-export async function uploadPrepared(uploader: Uploader, prepared: PreparedUpload[]): Promise<UploadedFile[]> {
+/** Release every prepared source without reading it. Never throws. */
+export async function closeAll(prepared: PreparedUpload[]): Promise<void> {
+  await Promise.all(prepared.map((p) => p.close().catch(() => undefined)));
+}
+
+/**
+ * Read and upload one at a time, so one file's bytes are in memory at once.
+ * Every source is released whatever happens. The aggregate budget is
+ * re-applied to the bytes actually read: declared sizes are what `fstat`
+ * said at preparation, and a file may have grown (or, on procfs, been 0).
+ */
+export async function uploadPrepared(uploader: Uploader, prepared: PreparedUpload[], policy: UploadPolicy): Promise<UploadedFile[]> {
   const out: UploadedFile[] = [];
-  for (const p of prepared) out.push(await uploader.upload({ name: p.name, mimeType: p.mimeType, data: await p.read() }));
+  let total = 0;
+  try {
+    for (const p of prepared) {
+      const data = await p.read();
+      total += data.length;
+      if (total > policy.maxTotalBytes) throw new Error(`attachments total over the ${fmt(policy.maxTotalBytes)} per-message budget`);
+      out.push(await uploader.upload({ name: p.name, mimeType: p.mimeType, data }));
+    }
+  } finally {
+    await closeAll(prepared);
+  }
   return out;
 }
 
@@ -419,7 +496,7 @@ export async function uploadPrepared(uploader: Uploader, prepared: PreparedUploa
  *  then fails leaves them unreferenced, and Zulip garbage-collects unclaimed
  *  uploads after a week. */
 export async function uploadAttachmentArgs(uploader: Uploader, args: unknown, policy: UploadPolicy): Promise<UploadedFile[]> {
-  return uploadPrepared(uploader, await prepareAttachments(args, policy));
+  return uploadPrepared(uploader, await prepareAttachments(args, policy), policy);
 }
 
 /** The markdown Zulip uses to attach an upload to a message. */
@@ -452,7 +529,7 @@ export async function prepareBlocks(blocks: ContentBlock[], policy: UploadPolicy
     const size = base64DecodedLength(text);
     if (size === 0) continue;
     if (size > policy.maxBytes) throw new Error(`${block.type} block ${i + 1} is ${fmt(size)}, over the ${fmt(policy.maxBytes)} upload ceiling`);
-    const declared = typeof block.mimeType === 'string' && isValidMimeType(block.mimeType) ? block.mimeType : undefined;
+    const declared = bareMimeType(block.mimeType);
     const kind = block.type;
     prepared.push({
       name: `${kind}-${i + 1}.${extensionFor(declared)}`,
@@ -461,6 +538,7 @@ export async function prepareBlocks(blocks: ContentBlock[], policy: UploadPolicy
       async read() {
         return Buffer.from(text, 'base64');
       },
+      async close() {},
     });
   }
   checkBudget(prepared, policy);

@@ -242,11 +242,22 @@ base64 `data` works. A root that does not exist is a startup failure. To
 let an agent attach what it writes in its workspace, mount the workspace
 and name it as a root at the same path, e.g. `ZULIP_UPLOAD_ROOTS=workspace=./workspace`,
 so the mount-prefixed path the agent already knows is the attachment path.
+The check is bound to the file actually opened, not to its pathname, so a
+directory swapped for a symlink mid-request is caught too. What it cannot
+see is a hard link created inside a root to a file outside it: that needs
+a local writer in the root (and, with `fs.protected_hardlinks=1`, ownership
+of the target), so export roots only writers you trust can reach.
 
 Limits: one file up to the realm's advertised cap (or `ZULIP_UPLOAD_MAX_BYTES`),
 at most 10 files per message, 4× the per-file cap in total. The per-file
-ceiling is enforced on the bytes read, not only on `stat`, and base64 is
-measured before it is decoded.
+ceiling is enforced on the bytes read, not only on `stat`; the aggregate
+budget is checked on declared sizes before any read and again on the bytes
+actually read; base64 is measured before it is decoded. Files are read and
+uploaded one at a time, so peak memory is one file in three copies (the
+bytes, the multipart body, and the copy Node's fetch makes of the request
+body). On the MCPL publish path a media block with malformed base64 fails
+the publish; blocks the server cannot upload (no uploader, or a URI) are
+dropped as before.
 
 **Attention**
 `listen` / `unlisten` (Zulip stream subscription), `start_monitoring` /

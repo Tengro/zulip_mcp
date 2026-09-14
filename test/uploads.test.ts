@@ -10,13 +10,16 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
-import { mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { open } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   DEFAULT_UPLOAD_MAX_BYTES,
   MAX_ATTACHMENTS_PER_MESSAGE,
+  bareMimeType,
   base64DecodedLength,
+  closeAll,
   createZulipUploader,
   guessMimeType,
   isValidMimeType,
@@ -29,6 +32,8 @@ import {
   sniffImageType,
   uploadAttachmentArgs,
   uploadBlocks,
+  uploadPrepared,
+  verifyOpenedInsideRoot,
   withAttachmentLinks,
   type UploadPolicy,
   type Uploader,
@@ -189,7 +194,11 @@ test('a local file is <root>/<path>, confined to the named root after symlink re
     await assert.rejects(prepareAttachmentArg({ file: 'other/report.md' }, p), /unknown upload root "other"; available roots: notes/);
     await assert.rejects(prepareAttachmentArg({ file: 'notes' }, p), /names a root, not a file/);
     await assert.rejects(prepareAttachmentArg({ file: 'notes/sub' }, p), /not a regular file/);
-    await assert.rejects(prepareAttachmentArg({ file: 'notes/missing.md' }, p), /ENOENT/);
+    await assert.rejects(prepareAttachmentArg({ file: 'notes/missing.md' }, p), (err: Error) => {
+      assert.equal(err.message, 'attachment "notes/missing.md": not found', 'no host path in the message');
+      return true;
+    });
+    await assert.rejects(prepareAttachmentArg({ file: 'notes/sub/report.md/x' }, p), /attachment "notes\/sub\/report.md\/x": not found/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -231,6 +240,9 @@ test('inline data is strict base64, measured before it is decoded', async () => 
   await assert.rejects(prepareAttachmentArg({ file: 'd/a', data: 'aGk=' }, p), /exactly one of `file`/);
   await assert.rejects(prepareAttachmentArg('x' as never, p), /must be an object/);
   await assert.rejects(prepareAttachmentArg({ data: 'aGk=', name: 'a.txt', mime_type: 'text/plain\r\nX: 1' }, p), /mime_type must be type\/subtype/);
+  assert.equal((await prepareAttachmentArg({ data: 'aGk=', name: 'a.bin', mime_type: 'text/plain; charset=utf-8' }, p)).mimeType, 'text/plain', 'parameters are dropped');
+  assert.equal(bareMimeType('Image/PNG ; q=1'), 'Image/PNG');
+  assert.equal(bareMimeType('; charset=utf-8'), undefined);
 
   // Whitespace-wrapped base64 (as many encoders emit) is accepted.
   const wrapped = await prepareAttachmentArg({ data: 'aGVs\nbG8=\n', name: 'a.txt' }, p);
@@ -265,6 +277,82 @@ test('withAttachmentLinks appends Zulip-style links, or is just the links when t
   assert.equal(withAttachmentLinks('plain', []), 'plain');
 });
 
+// ── Lifecycle ──
+
+/** Open descriptors of this process (macOS and Linux both list them under /dev/fd). */
+function openFds(): number {
+  return readdirSync('/dev/fd').length;
+}
+
+test('a refused batch releases every handle it opened without reading anything', async () => {
+  const dir = tmp();
+  try {
+    for (const n of ['a', 'b', 'c']) writeFileSync(join(dir, `${n}.txt`), 'x'.repeat(100));
+    const p = policy({ roots: new Map([['d', dir]]), maxBytes: 100, maxTotalBytes: 250 });
+    const before = openFds();
+    // Refused by the aggregate budget after three handles are open.
+    await assert.rejects(prepareAttachments([{ file: 'd/a.txt' }, { file: 'd/b.txt' }, { file: 'd/c.txt' }], p), /per-message budget/);
+    assert.equal(openFds(), before, 'handles released');
+    // Refused by a later invalid entry.
+    await assert.rejects(prepareAttachments([{ file: 'd/a.txt' }, { data: 'aGk=' }], p), /need a `name`/);
+    assert.equal(openFds(), before);
+    // close() is idempotent and read() afterwards refuses.
+    const one = await prepareAttachmentArg({ file: 'd/a.txt' }, p);
+    await one.close();
+    await one.close();
+    await assert.rejects(one.read(), /already read or released/);
+    assert.equal(openFds(), before);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('uploadPrepared releases the remaining handles when an upload throws, and re-applies the budget to bytes actually read', async () => {
+  const dir = tmp();
+  try {
+    for (const n of ['a', 'b', 'c']) writeFileSync(join(dir, `${n}.txt`), 'x'.repeat(100));
+    const p = policy({ roots: new Map([['d', dir]]), maxBytes: 150, maxTotalBytes: 250 });
+    const before = openFds();
+    const prepared = await prepareAttachments([{ file: 'd/a.txt' }, { file: 'd/b.txt' }, { file: 'd/c.txt' }], p.roots.size ? { ...p, maxTotalBytes: 300 } : p);
+    assert.equal(openFds(), before + 3);
+    await assert.rejects(uploadPrepared({ async upload() { throw new Error('quota'); } }, prepared, { ...p, maxTotalBytes: 300 }), /quota/);
+    assert.equal(openFds(), before, 'the two unread handles are released too');
+
+    // Declared sizes fit the budget; one file grows before it is read.
+    const { uploader, uploaded } = fakeUploader();
+    const again = await prepareAttachments([{ file: 'd/a.txt' }, { file: 'd/b.txt' }, { file: 'd/c.txt' }], { ...p, maxTotalBytes: 300 });
+    writeFileSync(join(dir, 'b.txt'), 'x'.repeat(150));
+    await assert.rejects(uploadPrepared(uploader, again, { ...p, maxTotalBytes: 260 }), /attachments total over the 260B per-message budget/);
+    assert.deepEqual(uploaded.map((u) => u.name), ['a.txt', 'b.txt'], 'stopped at the file that broke the budget (100 + 150 + 100 > 260)');
+    assert.equal(openFds(), before);
+    await closeAll(again);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the containment check is bound to the opened object, not to the pathname', async () => {
+  const dir = tmp();
+  try {
+    const root = join(dir, 'root');
+    mkdirSync(root);
+    writeFileSync(join(root, 'in.txt'), 'in');
+    writeFileSync(join(dir, 'out.txt'), 'out');
+    const insideHandle = await open(join(root, 'in.txt'), 'r');
+    const outsideHandle = await open(join(dir, 'out.txt'), 'r');
+    try {
+      assert.equal(await verifyOpenedInsideRoot(insideHandle, join(root, 'in.txt'), root), true);
+      // What was opened is outside the root although the pathname is inside: refused.
+      assert.equal(await verifyOpenedInsideRoot(outsideHandle, join(root, 'in.txt'), root), false);
+    } finally {
+      await insideHandle.close();
+      await outsideHandle.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // ── Blocks ──
 
 const PNG_HEAD = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]);
@@ -280,13 +368,15 @@ test('media blocks with inline data become uploads; URIs of any scheme and text 
     { type: 'audio', data: b64('ogg!'), mimeType: 'audio/ogg' },
     { type: 'image', uri: 'https://example.com/remote.png' },
     { type: 'image', data: b64('svg'), mimeType: 'image/svg+xml' },
+    { type: 'image', data: b64('jpg'), mimeType: 'image/jpeg; q=0.9' },
   ], p);
   assert.deepEqual(uploaded.map((u) => [u.name, u.bytes, u.mimeType]), [
     ['image-2.png', 'png!', 'image/png'],
     ['audio-5.ogg', 'ogg!', 'audio/ogg'],
     ['image-7.svg', 'svg', 'image/svg+xml'],
+    ['image-8.jpg', 'jpg', 'image/jpeg'],
   ]);
-  assert.deepEqual(out.map((f) => f.path), ['/user_uploads/1/image-2.png', '/user_uploads/1/audio-5.ogg', '/user_uploads/1/image-7.svg']);
+  assert.deepEqual(out.map((f) => f.path), ['/user_uploads/1/image-2.png', '/user_uploads/1/audio-5.ogg', '/user_uploads/1/image-7.svg', '/user_uploads/1/image-8.jpg']);
 });
 
 test('an image block without a type is sniffed so it still previews; an invalid type is dropped, not injected', async () => {
