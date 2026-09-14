@@ -20,7 +20,7 @@
  */
 
 import { randomBytes } from 'node:crypto';
-import { constants as fsConstants, type FileHandle, open, readlink, realpath, stat } from 'node:fs/promises';
+import { constants as fsConstants, type FileHandle, open, readlink, realpath } from 'node:fs/promises';
 import { realpathSync } from 'node:fs';
 import { basename, isAbsolute, resolve, sep } from 'node:path';
 import type { ContentBlock } from '@animalabs/mcpl-core';
@@ -286,6 +286,9 @@ function fsFailure(file: string, err: unknown): Error {
 
 /** Resolve `<root>/<rest>` against the named root; the result is canonical and inside the root. */
 async function resolveUnderRoot(file: string, policy: UploadPolicy): Promise<{ canonical: string; rootDir: string; rootName: string }> {
+  if (!LOCAL_FILES_SUPPORTED) {
+    throw new Error(`local-file attachments are supported on Linux only (containment is bound to the open descriptor via /proc/self/fd); pass base64 \`data\` instead`);
+  }
   if (policy.roots.size === 0) {
     throw new Error(`local-file attachments are disabled: no upload roots configured (set ZULIP_UPLOAD_ROOTS=name=/dir,...); pass base64 \`data\` instead`);
   }
@@ -313,23 +316,27 @@ async function resolveUnderRoot(file: string, policy: UploadPolicy): Promise<{ c
   return { canonical, rootDir, rootName };
 }
 
+/** Local-file attachments need descriptor-bound containment, which only procfs provides. */
+export const LOCAL_FILES_SUPPORTED = process.platform === 'linux';
+
 /**
  * Bind the containment check to the object actually opened, not to the
  * pathname it was opened by: a parent directory swapped for a symlink
  * between `realpath` and `open` would otherwise open a file outside the
- * root (O_NOFOLLOW guards only the final component). Linux tells us what
- * the descriptor refers to; elsewhere the opened inode must be the inode
- * at the (re-verified) canonical path.
+ * root (O_NOFOLLOW guards only the final component). `/proc/self/fd/N`
+ * says what the descriptor refers to. The opened object must be a strict
+ * descendant of the root: an opened regular file can never be the root
+ * itself, and a file unlinked after open reads back as `<root>/x (deleted)`,
+ * which still starts with `<root>/`. Nothing is stripped from the link —
+ * a sibling literally named `<root> (deleted)` must not pass as the root.
+ * Without procfs there is no descriptor-relative resolution in Node, and a
+ * pathname re-check is the race this guards against; callers refuse local
+ * files there instead (LOCAL_FILES_SUPPORTED).
  */
-export async function verifyOpenedInsideRoot(handle: FileHandle, canonical: string, rootDir: string): Promise<boolean> {
-  if (process.platform === 'linux') {
-    const actual = (await readlink(`/proc/self/fd/${handle.fd}`)).replace(/ \(deleted\)$/, '');
-    return inside(actual, rootDir);
-  }
-  const now = await realpath(canonical);
-  if (!inside(now, rootDir)) return false;
-  const [opened, at] = await Promise.all([handle.stat(), stat(now)]);
-  return opened.dev === at.dev && opened.ino === at.ino;
+export async function verifyOpenedInsideRoot(handle: FileHandle, rootDir: string): Promise<boolean> {
+  if (!LOCAL_FILES_SUPPORTED) return false;
+  const actual = await readlink(`/proc/self/fd/${handle.fd}`);
+  return actual.startsWith(rootDir + sep);
 }
 
 /** Read at most `maxBytes` (+1 to detect overflow), whatever `stat` claimed. */
@@ -364,9 +371,13 @@ async function prepareFile(arg: AttachmentArg, policy: UploadPolicy): Promise<Pr
   }
   let size: number;
   try {
-    if (!(await verifyOpenedInsideRoot(handle, canonical, rootDir))) {
-      throw new Error(`attachment "${file}": resolves outside upload root "${rootName}"`);
+    let contained: boolean;
+    try {
+      contained = await verifyOpenedInsideRoot(handle, rootDir);
+    } catch (err) {
+      throw fsFailure(file, err);
     }
+    if (!contained) throw new Error(`attachment "${file}": resolves outside upload root "${rootName}"`);
     const info = await handle.stat();
     if (!info.isFile()) throw new Error(`attachment "${file}" is not a regular file`);
     if (info.size > policy.maxBytes) throw new Error(`attachment "${file}" is ${fmt(info.size)}, over the ${fmt(policy.maxBytes)} upload ceiling`);

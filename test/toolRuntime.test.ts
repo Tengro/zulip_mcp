@@ -13,7 +13,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ZulipToolRuntime, stripSuppressedReactions } from '../src/tool-runtime.ts';
 import type { ZulipSession } from '../src/zulip-client.ts';
-import type { UploadPolicy } from '../src/uploads.ts';
+import { LOCAL_FILES_SUPPORTED, type UploadPolicy } from '../src/uploads.ts';
 
 function runtime(client: Record<string, unknown>): { tools: ZulipToolRuntime; dir: string } {
   const dir = mkdtempSync(join(tmpdir(), 'zulip-tools-'));
@@ -179,7 +179,7 @@ test('send_dm resolves recipients, then uploads, then sends with the links; uplo
   }
 });
 
-test('upload_file and the send tools read local files only through a configured root', async () => {
+test('upload_file and the send tools read local files only through a configured root', { skip: LOCAL_FILES_SUPPORTED ? false : 'local-file attachments are Linux-only' }, async () => {
   const sends: Record<string, unknown>[] = [];
   const client = { messages: { async send(p: Record<string, unknown>) { sends.push(p); return { result: 'success', id: 3 }; } } };
   const { uploader, uploaded } = fakeUploader();

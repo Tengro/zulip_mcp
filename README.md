@@ -242,9 +242,13 @@ base64 `data` works. A root that does not exist is a startup failure. To
 let an agent attach what it writes in its workspace, mount the workspace
 and name it as a root at the same path, e.g. `ZULIP_UPLOAD_ROOTS=workspace=./workspace`,
 so the mount-prefixed path the agent already knows is the attachment path.
-The check is bound to the file actually opened, not to its pathname, so a
-directory swapped for a symlink mid-request is caught too. What it cannot
-see is a hard link created inside a root to a file outside it: that needs
+The check is bound to the file actually opened, not to its pathname (via
+`/proc/self/fd`), so a directory swapped for a symlink mid-request is
+caught too. That makes local-file attachments Linux-only: on other
+platforms Node has no descriptor-relative resolution, a pathname re-check
+would be the very race the guard exists for, and so `file` is refused
+there with a pointer to base64 `data`. What the check cannot see is a hard
+link created inside a root to a file outside it: that needs
 a local writer in the root (and, with `fs.protected_hardlinks=1`, ownership
 of the target), so export roots only writers you trust can reach.
 

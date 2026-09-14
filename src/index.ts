@@ -49,7 +49,7 @@ import { DEFAULT_BACKSCROLL, ZulipAdapter } from './platforms/zulip.js';
 import { DEFAULT_CATCHUP_LIMIT, ZulipMcplServer } from './server.js';
 import { DEFAULT_MISSED_BLOCK_MAX_CHARS } from './delivery.js';
 import { ZulipToolRuntime } from './tool-runtime.js';
-import { createZulipUploader, resolveUploadPolicy } from './uploads.js';
+import { LOCAL_FILES_SUPPORTED, createZulipUploader, resolveUploadPolicy } from './uploads.js';
 import { initializeZulipClient } from './zulip-client.js';
 
 export { fetchAttachmentBytes, extractZulipAttachments, cleanContent } from './content.js';
@@ -105,6 +105,7 @@ async function main(): Promise<void> {
   const uploader = session.realm ? createZulipUploader(session) : undefined;
   if (uploadPolicy.roots.size > 0) {
     console.error(`[zulip-mcp] upload roots: ${[...uploadPolicy.roots].map(([n, d]) => `${n}=${d}`).join(', ')}`);
+    if (!LOCAL_FILES_SUPPORTED) console.error(`[zulip-mcp] ZULIP_UPLOAD_ROOTS is set but local-file attachments are Linux-only on this platform (${process.platform}); base64 data still works`);
   }
   const adapter = new ZulipAdapter(session.client, session.selfUserId, session.sessionId, {
     uploader,

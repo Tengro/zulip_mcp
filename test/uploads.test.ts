@@ -12,6 +12,9 @@ import { createServer } from 'node:http';
 import { once } from 'node:events';
 import { mkdtempSync, mkdirSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { open } from 'node:fs/promises';
+
+/** Local-file attachments are Linux-only (descriptor-bound containment); their tests run there. */
+const linuxOnly = { skip: LOCAL_FILES_SUPPORTED ? false : 'local-file attachments are Linux-only' };
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -23,6 +26,7 @@ import {
   createZulipUploader,
   guessMimeType,
   isValidMimeType,
+  LOCAL_FILES_SUPPORTED,
   multipartBody,
   parseUploadRoots,
   prepareAttachmentArg,
@@ -157,15 +161,17 @@ test('parseUploadRoots takes name=path entries, canonicalises them, and refuses 
 });
 
 test('with no roots, local files are refused outright; inline data still works', async () => {
-  await assert.rejects(prepareAttachmentArg({ file: 'notes/a.txt' }, policy()), /local-file attachments are disabled: no upload roots configured/);
-  await assert.rejects(prepareAttachmentArg({ file: '/etc/passwd' }, policy()), /no upload roots configured/);
+  // Off Linux the platform refusal comes first; either way nothing is opened.
+  const refused = LOCAL_FILES_SUPPORTED ? /local-file attachments are disabled: no upload roots configured/ : /supported on Linux only/;
+  await assert.rejects(prepareAttachmentArg({ file: 'notes/a.txt' }, policy()), refused);
+  await assert.rejects(prepareAttachmentArg({ file: '/etc/passwd' }, policy()), refused);
   const inline = await prepareAttachmentArg({ data: b64('hi'), name: 'a.txt' }, policy());
   assert.equal((await inline.read()).toString(), 'hi');
   // An empty array needs neither roots nor an uploader.
   assert.deepEqual(await prepareAttachments([], policy()), []);
 });
 
-test('a local file is <root>/<path>, confined to the named root after symlink resolution', async () => {
+test('a local file is <root>/<path>, confined to the named root after symlink resolution', linuxOnly, async () => {
   const dir = tmp();
   try {
     const notes = join(dir, 'notes');
@@ -204,7 +210,7 @@ test('a local file is <root>/<path>, confined to the named root after symlink re
   }
 });
 
-test('the per-file ceiling is enforced on the bytes read, not only on stat', async () => {
+test('the per-file ceiling is enforced on the bytes read, not only on stat', linuxOnly, async () => {
   const dir = tmp();
   try {
     const f = join(dir, 'grow.txt');
@@ -284,7 +290,7 @@ function openFds(): number {
   return readdirSync('/dev/fd').length;
 }
 
-test('a refused batch releases every handle it opened without reading anything', async () => {
+test('a refused batch releases every handle it opened without reading anything', linuxOnly, async () => {
   const dir = tmp();
   try {
     for (const n of ['a', 'b', 'c']) writeFileSync(join(dir, `${n}.txt`), 'x'.repeat(100));
@@ -307,7 +313,7 @@ test('a refused batch releases every handle it opened without reading anything',
   }
 });
 
-test('uploadPrepared releases the remaining handles when an upload throws, and re-applies the budget to bytes actually read', async () => {
+test('uploadPrepared releases the remaining handles when an upload throws, and re-applies the budget to bytes actually read', linuxOnly, async () => {
   const dir = tmp();
   try {
     for (const n of ['a', 'b', 'c']) writeFileSync(join(dir, `${n}.txt`), 'x'.repeat(100));
@@ -331,22 +337,48 @@ test('uploadPrepared releases the remaining handles when an upload throws, and r
   }
 });
 
-test('the containment check is bound to the opened object, not to the pathname', async () => {
+test('the containment check is bound to the opened object, not to the pathname', linuxOnly, async () => {
   const dir = tmp();
   try {
     const root = join(dir, 'root');
     mkdirSync(root);
     writeFileSync(join(root, 'in.txt'), 'in');
     writeFileSync(join(dir, 'out.txt'), 'out');
+    writeFileSync(`${root} (deleted)`, 'sibling');
     const insideHandle = await open(join(root, 'in.txt'), 'r');
     const outsideHandle = await open(join(dir, 'out.txt'), 'r');
+    const siblingHandle = await open(`${root} (deleted)`, 'r');
+    const unlinked = await open(join(root, 'in.txt'), 'r');
     try {
-      assert.equal(await verifyOpenedInsideRoot(insideHandle, join(root, 'in.txt'), root), true);
+      assert.equal(await verifyOpenedInsideRoot(insideHandle, root), true);
       // What was opened is outside the root although the pathname is inside: refused.
-      assert.equal(await verifyOpenedInsideRoot(outsideHandle, join(root, 'in.txt'), root), false);
+      assert.equal(await verifyOpenedInsideRoot(outsideHandle, root), false);
+      // A sibling literally named "<root> (deleted)" is not the root.
+      assert.equal(await verifyOpenedInsideRoot(siblingHandle, root), false);
+      // A file unlinked after open is still the file that was inside.
+      rmSync(join(root, 'in.txt'));
+      assert.equal(await verifyOpenedInsideRoot(unlinked, root), true);
     } finally {
-      await insideHandle.close();
-      await outsideHandle.close();
+      await Promise.all([insideHandle, outsideHandle, siblingHandle, unlinked].map((h) => h.close()));
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('off Linux, local files are refused with the base64 hint and nothing is opened', { skip: LOCAL_FILES_SUPPORTED ? 'Linux' : false }, async () => {
+  const dir = tmp();
+  try {
+    writeFileSync(join(dir, 'a.txt'), 'a');
+    const p = policy({ roots: new Map([['d', dir]]) });
+    const before = readdirSync('/dev/fd').length;
+    await assert.rejects(prepareAttachmentArg({ file: 'd/a.txt' }, p), /supported on Linux only .* pass base64 `data` instead/);
+    assert.equal(readdirSync('/dev/fd').length, before);
+    const handle = await open(join(dir, 'a.txt'), 'r');
+    try {
+      assert.equal(await verifyOpenedInsideRoot(handle, dir), false, 'the guard itself fails closed');
+    } finally {
+      await handle.close();
     }
   } finally {
     rmSync(dir, { recursive: true, force: true });
