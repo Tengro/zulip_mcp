@@ -87,6 +87,7 @@ are likely to touch:
 | `ZULIP_SUPPRESSED_REACTIONS_BASELINE` | `DISCORD_SUPPRESSED_REACTIONS_BASELINE` | Host-owned reaction markers withheld from the model; re-read every start, never persisted (connectome-host injects the `DISCORD_` name into every MCPL child) |
 | `ZULIP_CATCHUP_LIMIT` | 3000 | Per-channel ceiling for catch-up and gap recovery (max 10000). For an always-open desk channel a few hundred is plenty |
 | `ZULIP_MISSED_BLOCK_MAX_CHARS` | 40000 | Size cap on one `<missed>` block; the oldest lines are elided with a `fetch_history` pointer |
+| `ZULIP_ATTRIBUTE_DELIVERY` | true | Render `[time id=N] [#stream > topic] Author: ` into every delivered body; `false` for a host that renders the structured fields itself |
 | `ZULIP_BACKSCROLL_DEFAULT`, `ZULIP_BACKSCROLL_CHANNELS` | 500 | History cap on `channels/open`, per stream as `general:50,dev:200` |
 | `ZULIP_INLINE_IMAGES`, `ZULIP_INLINE_IMAGES_MAX`, `ZULIP_ATTACHMENT_INLINE_MAX_BYTES` | true, 4, 5120 | Attachment inlining on live delivery |
 | `AGENT_TIMEZONE`, `AGENT_TIMESTAMP_STYLE` | system, `full` | Agent-visible timestamps in catch-up blocks |
@@ -222,6 +223,16 @@ unread tools), `channel_missed`, `mute_channel` / `unmute_channel`,
 Message ids are realm-global and monotonic, which makes them cursors: every
 history line, `<missed>` block, and incoming message leads with one so the
 agent can `fetch_around` it.
+
+**What the model reads.** A delivered message carries its author, topic and
+id as structured fields, but hosts render only the content blocks, so the
+body itself leads with them, in the same shape as a `fetch_history` line:
+`[<time> id=N] [#stream > topic] Author (mention): text`, or `[DM]` in place
+of the stream and topic. This applies to live delivery (`channels/incoming`
+and `push/event`) and to the backscroll returned on `channels/open`; the
+reply affordance on a new DM and the attachment note keep their places
+around it. A host that renders the structured fields itself sets
+`ZULIP_ATTRIBUTE_DELIVERY=false` and gets bare bodies.
 
 ## State on disk
 

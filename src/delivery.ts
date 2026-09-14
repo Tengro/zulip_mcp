@@ -26,6 +26,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { IncomingChannelMessage, TextContent } from '@animalabs/mcpl-core';
+import { isDmChannelId } from './history.js';
 
 export interface MissedTally {
   /** Watermark at the moment the channel was closed (0 = none known). */
@@ -337,6 +338,31 @@ export function viewOf(m: IncomingChannelMessage): MissedView {
     timestamp: new Date(m.timestamp),
     attachmentNames: attachments.map((a) => a.name ?? 'attachment'),
   };
+}
+
+/**
+ * Render the who/where/when of a message into its body, the way the
+ * history tools and the `<missed>` block already do, so the model sees
+ * `[<time> id=N] [#stream > topic] Author (mention): text` and not a bare
+ * body. The structured fields (author, threadId, metadata) travel too;
+ * hosts render the content blocks only, and an agent that reads "ship it?"
+ * with no author has no way to tell who asked. Idempotent
+ * (`metadata.attributed`), so a replay cannot double the header.
+ */
+export function attributeMessage(m: IncomingChannelMessage, formatTime: (d: Date) => string): IncomingChannelMessage {
+  const meta = (typeof m.metadata === 'object' && m.metadata !== null ? m.metadata : {}) as Record<string, unknown>;
+  if (meta.attributed === true) return m;
+  const isDM = meta.isDM === true || isDmChannelId(m.channelId);
+  const topic = typeof meta.topic === 'string' ? meta.topic : (m.threadId ?? '');
+  const where = isDM ? '[DM]' : `[#${m.channelId.startsWith('zulip:') ? m.channelId.slice('zulip:'.length) : m.channelId} > ${topic}]`;
+  const ts = formatTime(new Date(m.timestamp));
+  const mark = !isDM && meta.mentioned === true ? ' (mention)' : '';
+  const header = `[${ts ? `${ts} ` : ''}id=${m.messageId}] ${where} ${m.author.name}${mark}: `;
+  const index = m.content.findIndex((c) => c.type === 'text');
+  const content = [...m.content];
+  if (index < 0) content.unshift({ type: 'text', text: header.trimEnd() });
+  else content[index] = { type: 'text', text: header + (content[index] as TextContent).text };
+  return { ...m, content, metadata: { ...meta, attributed: true } };
 }
 
 /** Messages around each mention, ±`vicinity` by count (robust to channel pace). */

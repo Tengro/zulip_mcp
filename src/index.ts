@@ -24,6 +24,8 @@
  *   ZULIP_MUTED_STREAMS                           materialization (then the file is authoritative)
  *   ZULIP_SUPPRESSED_REACTIONS_BASELINE         - host-injected reaction-suppression seed
  *   AGENT_TIMEZONE / AGENT_TIMESTAMP_STYLE      - agent-visible timestamps (IANA zone; full|compact|time|none)
+ *   ZULIP_ATTRIBUTE_DELIVERY                    - "false" delivers bare bodies; default renders
+ *                                                 "[time id=N] [#stream > topic] Author: " into each
  *   ZULIP_MAX_MESSAGE_LENGTH                    - the realm's max message length; longer sends are split (10000)
  *   ZULIP_INLINE_IMAGES                         - "false" to stop inlining images on live delivery
  *   ZULIP_INLINE_IMAGES_MAX                     - images inlined per message (4)
@@ -114,6 +116,7 @@ async function main(): Promise<void> {
     sessionId: session.sessionId,
     catchupLimit: intEnv('ZULIP_CATCHUP_LIMIT', DEFAULT_CATCHUP_LIMIT),
     missedBlockMaxChars: intEnv('ZULIP_MISSED_BLOCK_MAX_CHARS', DEFAULT_MISSED_BLOCK_MAX_CHARS),
+    attributeDelivery: process.env.ZULIP_ATTRIBUTE_DELIVERY !== 'false',
     filters,
     attachments: {
       // Same validation as fetch_attachment: only /user_uploads/ on the realm

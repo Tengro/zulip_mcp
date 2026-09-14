@@ -52,7 +52,7 @@ import {
 } from '@animalabs/mcpl-core';
 import { ChannelManager, type HostClient } from './channels.js';
 import { ContextProvider } from './context.js';
-import { DeliveryState, renderMissedBlock, selectMissed, viewOf, DEFAULT_MISSED_BLOCK_MAX_CHARS } from './delivery.js';
+import { DeliveryState, attributeMessage, renderMissedBlock, selectMissed, viewOf, DEFAULT_MISSED_BLOCK_MAX_CHARS } from './delivery.js';
 import { McplRpcError, capabilityDenied } from './errors.js';
 import { MESSAGING_FEATURE_SET, buildServerCapabilities, featureSetForTool } from './feature-sets.js';
 import { isDmChannelId } from './history.js';
@@ -112,6 +112,8 @@ export interface ZulipMcplServerOptions {
   attachments?: { source: AttachmentSource; inline: InlineOptions };
   /** Size cap (characters) on one `<missed>` catch-up block; the oldest lines are elided. */
   missedBlockMaxChars?: number;
+  /** Render `[time id=N] [#stream > topic] Author: ` into every delivered body (default true). `false` for a host that renders the structured fields itself. */
+  attributeDelivery?: boolean;
 }
 
 export class ZulipMcplServer {
@@ -143,6 +145,7 @@ export class ZulipMcplServer {
   private readonly catchupLimit: number;
   private readonly missedBlockMaxChars: number;
   private readonly formatTime: (d: Date) => string;
+  private readonly attributeDelivery: boolean;
   private readonly filters: FiltersPlane | null;
 
   constructor(
@@ -154,6 +157,7 @@ export class ZulipMcplServer {
     this.catchupLimit = Math.min(CATCHUP_HARD_CAP, Math.max(0, options.catchupLimit ?? DEFAULT_CATCHUP_LIMIT));
     this.missedBlockMaxChars = Math.max(1000, options.missedBlockMaxChars ?? DEFAULT_MISSED_BLOCK_MAX_CHARS);
     this.formatTime = options.formatTime ?? defaultTimeFormatter();
+    this.attributeDelivery = options.attributeDelivery !== false;
     this.filters = options.filters ?? null;
     this.delivery = new DeliveryState(options.stateDir ?? null, options.sessionId ?? 'default');
     // A widened stream allowlist means channels the host has never seen:
@@ -666,7 +670,7 @@ export class ZulipMcplServer {
         afterMessageId:
           params.history?.sinceLastSeen && watermark !== undefined ? String(watermark) : undefined,
       });
-      result.history = this.projectHistoryReactions(page.messages);
+      result.history = this.projectHistoryReactions(page.messages).map((m) => this.attributed(m));
       result.historyTruncated = requested > limit;
       // Handed to the host in this very response: forwarded.
       for (const m of page.messages) this.accepted(descriptor.id, Number(m.messageId));
@@ -676,6 +680,11 @@ export class ZulipMcplServer {
     this.delivery.markOpen(descriptor.id);
     this.delivery.save();
     return result;
+  }
+
+  /** The delivered form of a message: attributed unless the host asked for bare bodies. */
+  private attributed(message: IncomingChannelMessage): IncomingChannelMessage {
+    return this.attributeDelivery ? attributeMessage(message, this.formatTime) : message;
   }
 
   private handleChannelClose(params: ChannelsCloseParams): { closed: boolean } {
@@ -848,6 +857,13 @@ export class ZulipMcplServer {
       if (blocks.length > 0) message = { ...message, content: [...message.content, ...blocks] };
     }
 
+    // Who said it, where and when, in the body the model reads. The
+    // structured fields stay; this is what a host that renders only the
+    // content blocks shows the model (the Discord surface does the same).
+    // The missed tally below counts the body as written, not the header.
+    const bodyText = viewOf(message).text;
+    message = this.attributed(message);
+
     // The first message of a DM conversation carries an explicit reply
     // affordance: DMs have no subscription semantics, and the agent should
     // not have to discover the send path by trial.
@@ -874,7 +890,7 @@ export class ZulipMcplServer {
       return;
     }
 
-    if (this.delivery.countMissed(channelId, { id, text: viewOf(message).text })) this.delivery.save();
+    if (this.delivery.countMissed(channelId, { id, text: bodyText })) this.delivery.save();
   }
 
   /**

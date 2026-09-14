@@ -159,6 +159,7 @@ interface HarnessOptions {
   filters?: FiltersPlane;
   attachments?: ZulipMcplServerOptions['attachments'];
   batchWindowMs?: number;
+  attributeDelivery?: boolean;
   /** A second connection to a server that already served one (the TCP case). */
   reuse?: { server: ZulipMcplServer; adapter: FakeAdapter };
 }
@@ -182,6 +183,7 @@ function harness(opts: HarnessOptions = {}): Harness {
     formatTime: () => 'T',
     filters: opts.filters,
     attachments: opts.attachments,
+    attributeDelivery: opts.attributeDelivery,
   });
 
   const hostSaw: JsonRpcRequest[] = [];
@@ -464,6 +466,10 @@ test('open → incoming with tags → publish routes to the topic of the convers
   await until(() => h.incoming.length === 1, 'channels/incoming');
   assert.equal(h.incoming[0].messageId, '2');
   assert.deepEqual(h.incoming[0].tags, ['chat:mention', 'chat:from-human']);
+  // The body the model reads says who, where and when; the fields stay.
+  assert.equal((h.incoming[0].content[0] as { text: string }).text, '[T id=2] [#general > deploys] Ann (mention): ship it?');
+  assert.deepEqual(h.incoming[0].author, { id: '9', name: 'Ann' });
+  assert.equal(h.incoming[0].threadId, 'deploys');
 
   const published = (await h.host.sendRequest(method.CHANNELS_PUBLISH, {
     conversationId: 'c1',
@@ -613,6 +619,20 @@ test('a mention on a closed channel is pushed, ambient is tallied, and channel_m
   await h.close();
 });
 
+test('ZULIP_ATTRIBUTE_DELIVERY=false delivers bare bodies on every surface, for a host that renders the fields itself', async () => {
+  const h = harness({ attributeDelivery: false, history: [streamMsg(1)] });
+  await initialize(h, true);
+  await settled(h);
+  const opened = (await h.host.sendRequest(method.CHANNELS_OPEN, {
+    channelId: 'zulip:general', type: 'zulip', address: {}, history: { limit: 5 },
+  })) as { history?: IncomingChannelMessage[] };
+  assert.equal((opened.history![0].content[0] as { text: string }).text, 'msg 1');
+  h.adapter.emit!(streamMsg(2, { mentioned: true, text: '@bot ping' }));
+  await until(() => h.incoming.length === 1, 'incoming');
+  assert.equal((h.incoming[0].content[0] as { text: string }).text, '@bot ping');
+  await h.close();
+});
+
 test('channels/open returns capped history before the lifecycle commits, and subscribes the bot (§14.4)', async () => {
   const h = harness({ history: Array.from({ length: 12 }, (_, i) => streamMsg(i + 1)) });
   await initialize(h, true);
@@ -623,6 +643,7 @@ test('channels/open returns capped history before the lifecycle commits, and sub
   })) as { channel: ChannelDescriptor; history?: IncomingChannelMessage[]; historyTruncated?: boolean };
   assert.deepEqual(opened.history!.map((m) => m.messageId), ['8', '9', '10', '11', '12']);
   assert.equal(opened.historyTruncated, false);
+  assert.equal((opened.history![0].content[0] as { text: string }).text, '[T id=8] [#general > deploys] Ann: msg 8', 'backscroll is attributed like live delivery');
   assert.equal((opened.history![0].metadata as { backscroll: boolean }).backscroll, true);
   assert.deepEqual(h.adapter.subscribed, ['zulip:general']);
   assert.equal(h.server.delivery.watermark('zulip:general'), 12, 'returned history counts as forwarded');
@@ -755,13 +776,13 @@ test('a DM from a new conversation registers its channel, is pushed with a reply
   assert.equal((push.origin as { stream?: string }).stream, undefined);
   const first = (push.payload.content[0] as { text: string }).text;
   assert.match(first, /^<system>Direct message from Bo \(user id 42\)\. To reply, use send_dm\(\["42"\]\) or publish to channel zulip:dm:42/);
-  assert.equal((push.payload.content[1] as { text: string }).text, 'hey, got a minute?');
+  assert.equal((push.payload.content[1] as { text: string }).text, '[T id=500] [DM] Bo: hey, got a minute?');
 
   // The second message from the same conversation carries no affordance.
   await until(() => h.server.delivery.watermark('zulip:dm:42') === 500, 'watermark');
   h.adapter.emit!({ ...dm, messageId: '501', content: [{ type: 'text', text: 'still there?' }] });
   await until(() => h.pushed.length === 2, 'second push');
-  assert.equal((h.pushed[1].payload.content[0] as { text: string }).text, 'still there?');
+  assert.equal((h.pushed[1].payload.content[0] as { text: string }).text, '[T id=501] [DM] Bo: still there?');
 
   // Opening the DM channel routes the conversation through channels/incoming,
   // and a publish reaches the adapter with the DM channel id.
