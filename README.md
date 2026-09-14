@@ -226,13 +226,23 @@ agent can `fetch_around` it.
 
 **What the model reads.** A delivered message carries its author, topic and
 id as structured fields, but hosts render only the content blocks, so the
-body itself leads with them, in the same shape as a `fetch_history` line:
+body itself leads with them, in the shape of a `fetch_history` line:
 `[<time> id=N] [#stream > topic] Author (mention): text`, or `[DM]` in place
-of the stream and topic. This applies to live delivery (`channels/incoming`
-and `push/event`) and to the backscroll returned on `channels/open`; the
-reply affordance on a new DM and the attachment note keep their places
-around it. A host that renders the structured fields itself sets
-`ZULIP_ATTRIBUTE_DELIVERY=false` and gets bare bodies.
+of the stream and topic. The time follows `AGENT_TIMEZONE` /
+`AGENT_TIMESTAMP_STYLE` like the `<missed>` block (`none` keeps the id;
+`fetch_history` itself prints UTC). This applies to live delivery
+(`channels/incoming` and `push/event`), to messages recovered onto an open
+channel after a gap or a refused batch, and to the backscroll returned on
+`channels/open`; the reply affordance on a new DM precedes it, and the
+attachment note and inlined images follow it. The header is not escaped:
+a name or topic containing `]: ` reads ambiguously to a regex, as it does
+on every other surface. A host that renders the structured fields itself
+sets `ZULIP_ATTRIBUTE_DELIVERY=false` and gets bare bodies. connectome-host
+does so under its `frontdesk` context strategy (the `clerk` recipe), which
+prepends `[zulip · #stream · topic "t" · @Author · time · msg N]` from the
+metadata; a recipe on that strategy sets the variable to `false` in the
+server's env or the model reads two headers. `autobiographical` and
+`passthrough` render nothing, and want the default.
 
 ## State on disk
 

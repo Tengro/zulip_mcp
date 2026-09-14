@@ -961,11 +961,12 @@ export class ZulipMcplServer {
     let n = 0;
     for (const m of this.projectHistoryReactions(msgs)) {
       // Watermarks move in onDelivered, once the host accepts the replay.
-      const queued = this.deliverToOpen(channelId, {
+      // Attributed like live delivery: a recovered message is read the same way.
+      const queued = this.deliverToOpen(channelId, this.attributed({
         ...m,
         tags: [...(m.tags ?? []), 'zulip:missed'],
         metadata: { ...(m.metadata as Record<string, unknown>), backscroll: undefined, recovered: true },
-      });
+      }));
       if (queued) n++;
     }
     return n;

@@ -305,7 +305,12 @@ test('attributeMessage: no timestamp style, attachments after the body, image-on
   assert.equal((imageOnly.content[0] as { text: string }).text, '[T id=17206924] [#qa > router] Mykhailo Buialo (mention):');
   assert.equal(imageOnly.content[1].type, 'image');
 
-  const once = attributeMessage(incoming(), () => 'T');
+  const original = incoming();
+  const once = attributeMessage(original, () => 'T');
   assert.deepEqual(attributeMessage(once, () => 'T'), once, 'a replay does not double the header');
-  assert.equal(viewOf(incoming()).text, '@Knowledge Resident do you have the same issue', 'the original is unchanged');
+  assert.equal(viewOf(original).text, '@Knowledge Resident do you have the same issue', 'the input is not mutated');
+  assert.equal((original.metadata as { attributed?: boolean }).attributed, undefined);
+
+  const bad = attributeMessage(incoming({ timestamp: 'not-a-date' }), () => { throw new Error('must not format an invalid date'); });
+  assert.equal((bad.content[0] as { text: string }).text.startsWith('[id=17206924] '), true, 'an unparseable timestamp drops the time, not the message');
 });

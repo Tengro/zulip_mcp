@@ -630,6 +630,11 @@ test('ZULIP_ATTRIBUTE_DELIVERY=false delivers bare bodies on every surface, for 
   h.adapter.emit!(streamMsg(2, { mentioned: true, text: '@bot ping' }));
   await until(() => h.incoming.length === 1, 'incoming');
   assert.equal((h.incoming[0].content[0] as { text: string }).text, '@bot ping');
+  // push/event for a mention on a closed channel, and a recovered replay, are bare too.
+  await h.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
+  h.adapter.emit!(streamMsg(3, { mentioned: true, text: '@bot closed' }));
+  await until(() => h.pushed.length === 1, 'push');
+  assert.equal((h.pushed[0].payload.content[0] as { text: string }).text, '@bot closed');
   await h.close();
 });
 
@@ -734,6 +739,7 @@ test('a queue-expiry gap is healed from history for open channels before the mar
   assert.deepEqual(h.incoming.slice(1, 3).map((m) => m.messageId), ['2', '3']);
   assert.ok(h.incoming[1].tags!.includes('zulip:missed'));
   assert.equal((h.incoming[1].metadata as { recovered: boolean }).recovered, true);
+  assert.equal((h.incoming[1].content[0] as { text: string }).text, '[T id=2] [#general > deploys] Ann: msg 2', 'a recovered message is attributed like a live one');
   const marker = h.incoming[3];
   assert.equal((marker.metadata as { kind: string; recoveredMessages: number }).kind, 'gap');
   assert.equal((marker.metadata as { recoveredMessages: number }).recoveredMessages, 2);

@@ -355,7 +355,8 @@ export function attributeMessage(m: IncomingChannelMessage, formatTime: (d: Date
   const isDM = meta.isDM === true || isDmChannelId(m.channelId);
   const topic = typeof meta.topic === 'string' ? meta.topic : (m.threadId ?? '');
   const where = isDM ? '[DM]' : `[#${m.channelId.startsWith('zulip:') ? m.channelId.slice('zulip:'.length) : m.channelId} > ${topic}]`;
-  const ts = formatTime(new Date(m.timestamp));
+  const at = new Date(m.timestamp);
+  const ts = Number.isNaN(at.getTime()) ? '' : formatTime(at);
   const mark = !isDM && meta.mentioned === true ? ' (mention)' : '';
   const header = `[${ts ? `${ts} ` : ''}id=${m.messageId}] ${where} ${m.author.name}${mark}: `;
   const index = m.content.findIndex((c) => c.type === 'text');
