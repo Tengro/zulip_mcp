@@ -58,6 +58,7 @@ export function formatAgentDateTime(
   value: Date | number,
   timeZone = resolveAgentTimeZone(),
   style: TimestampStyle = 'full',
+  options: { zoneName?: boolean } = {},
 ): string {
   if (style === 'none') return '';
   const date = value instanceof Date ? value : new Date(value);
@@ -72,5 +73,20 @@ export function formatAgentDateTime(
   if (style === 'compact') return `${get('year')}-${get('month')}-${get('day')} ${get('hour')}:${get('minute')}`;
   const rawOffset = get('timeZoneName');
   const offset = rawOffset === 'GMT' ? '+00:00' : rawOffset.replace('GMT', '');
-  return `${get('year')}-${get('month')}-${get('day')}T${get('hour')}:${get('minute')}:${get('second')}${offset} [${timeZone}]`;
+  const stamp = `${get('year')}-${get('month')}-${get('day')}T${get('hour')}:${get('minute')}:${get('second')}${offset}`;
+  return options.zoneName === false ? stamp : `${stamp} [${timeZone}]`;
+}
+
+/**
+ * The time on a message line (`[<time> id=N] ...`), resolved once from
+ * AGENT_TIMEZONE / AGENT_TIMESTAMP_STYLE. `full` drops its ` [Zone]` suffix
+ * here: the offset already fixes the instant, the zone is constant for the
+ * session, and a bracket inside the line's own bracket makes the line
+ * harder to read and to parse. An invalid date renders empty (the line
+ * keeps its id) rather than throwing inside delivery.
+ */
+export function agentLineTimeFormatter(env: NodeJS.ProcessEnv = process.env): (d: Date) => string {
+  const zone = resolveAgentTimeZone(env.AGENT_TIMEZONE);
+  const style = resolveTimestampStyle(env.AGENT_TIMESTAMP_STYLE);
+  return (d) => (Number.isNaN(d.getTime()) ? '' : formatAgentDateTime(d, zone, style, { zoneName: false }));
 }

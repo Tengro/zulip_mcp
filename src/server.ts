@@ -52,14 +52,14 @@ import {
 } from '@animalabs/mcpl-core';
 import { ChannelManager, type HostClient } from './channels.js';
 import { ContextProvider } from './context.js';
-import { DeliveryState, renderMissedBlock, selectMissed, viewOf, DEFAULT_MISSED_BLOCK_MAX_CHARS } from './delivery.js';
+import { DeliveryState, attributeMessage, renderMissedBlock, selectMissed, viewOf, DEFAULT_MISSED_BLOCK_MAX_CHARS } from './delivery.js';
 import { McplRpcError, capabilityDenied } from './errors.js';
 import { MESSAGING_FEATURE_SET, buildServerCapabilities, featureSetForTool } from './feature-sets.js';
 import { isDmChannelId } from './history.js';
 import type { FiltersPlane } from './filters.js';
 import { buildAttachmentBlocks, type AttachmentSource, type InlineOptions } from './attachments.js';
 import type { AttachmentRef } from './content.js';
-import { formatAgentDateTime, resolveAgentTimeZone, resolveTimestampStyle } from './timezone.js';
+import { agentLineTimeFormatter } from './timezone.js';
 import { CapabilityGrant } from './grant.js';
 import { StateTracker } from './state.js';
 import type { PlatformAdapter, PlatformSystemEvent, ReactionEvent } from './platforms/adapter.js';
@@ -112,6 +112,8 @@ export interface ZulipMcplServerOptions {
   attachments?: { source: AttachmentSource; inline: InlineOptions };
   /** Size cap (characters) on one `<missed>` catch-up block; the oldest lines are elided. */
   missedBlockMaxChars?: number;
+  /** Render `[time id=N] [#stream > topic] Author: ` into delivered bodies (live, push, recovered replays; default true). `false` for a host that renders the structured fields itself. */
+  attributeDelivery?: boolean;
 }
 
 export class ZulipMcplServer {
@@ -143,6 +145,7 @@ export class ZulipMcplServer {
   private readonly catchupLimit: number;
   private readonly missedBlockMaxChars: number;
   private readonly formatTime: (d: Date) => string;
+  private readonly attributeDelivery: boolean;
   private readonly filters: FiltersPlane | null;
 
   constructor(
@@ -153,7 +156,8 @@ export class ZulipMcplServer {
     this.adapters = new Map([[adapter.type, adapter]]);
     this.catchupLimit = Math.min(CATCHUP_HARD_CAP, Math.max(0, options.catchupLimit ?? DEFAULT_CATCHUP_LIMIT));
     this.missedBlockMaxChars = Math.max(1000, options.missedBlockMaxChars ?? DEFAULT_MISSED_BLOCK_MAX_CHARS);
-    this.formatTime = options.formatTime ?? defaultTimeFormatter();
+    this.formatTime = options.formatTime ?? agentLineTimeFormatter();
+    this.attributeDelivery = options.attributeDelivery !== false;
     this.filters = options.filters ?? null;
     this.delivery = new DeliveryState(options.stateDir ?? null, options.sessionId ?? 'default');
     // A widened stream allowlist means channels the host has never seen:
@@ -666,6 +670,8 @@ export class ZulipMcplServer {
         afterMessageId:
           params.history?.sinceLastSeen && watermark !== undefined ? String(watermark) : undefined,
       });
+      // Not attributed: the host hands this back as the channel_open tool
+      // result, JSON that already shows author, threadId and metadata.
       result.history = this.projectHistoryReactions(page.messages);
       result.historyTruncated = requested > limit;
       // Handed to the host in this very response: forwarded.
@@ -676,6 +682,11 @@ export class ZulipMcplServer {
     this.delivery.markOpen(descriptor.id);
     this.delivery.save();
     return result;
+  }
+
+  /** The delivered form of a message: attributed unless the host asked for bare bodies. */
+  private attributed(message: IncomingChannelMessage): IncomingChannelMessage {
+    return this.attributeDelivery ? attributeMessage(message, this.formatTime) : message;
   }
 
   private handleChannelClose(params: ChannelsCloseParams): { closed: boolean } {
@@ -848,6 +859,13 @@ export class ZulipMcplServer {
       if (blocks.length > 0) message = { ...message, content: [...message.content, ...blocks] };
     }
 
+    // Who said it, where and when, in the body the model reads. The
+    // structured fields stay; this is what a host that renders only the
+    // content blocks shows the model (the Discord surface does the same).
+    // The missed tally below counts the body as written, not the header.
+    const bodyText = viewOf(message).text;
+    message = this.attributed(message);
+
     // The first message of a DM conversation carries an explicit reply
     // affordance: DMs have no subscription semantics, and the agent should
     // not have to discover the send path by trial.
@@ -874,7 +892,7 @@ export class ZulipMcplServer {
       return;
     }
 
-    if (this.delivery.countMissed(channelId, { id, text: viewOf(message).text })) this.delivery.save();
+    if (this.delivery.countMissed(channelId, { id, text: bodyText })) this.delivery.save();
   }
 
   /**
@@ -945,11 +963,12 @@ export class ZulipMcplServer {
     let n = 0;
     for (const m of this.projectHistoryReactions(msgs)) {
       // Watermarks move in onDelivered, once the host accepts the replay.
-      const queued = this.deliverToOpen(channelId, {
+      // Attributed like live delivery: a recovered message is read the same way.
+      const queued = this.deliverToOpen(channelId, this.attributed({
         ...m,
         tags: [...(m.tags ?? []), 'zulip:missed'],
         metadata: { ...(m.metadata as Record<string, unknown>), backscroll: undefined, recovered: true },
-      });
+      }));
       if (queued) n++;
     }
     return n;
@@ -987,6 +1006,11 @@ export class ZulipMcplServer {
         authorName: message.author.name,
         isMention: meta.mentioned === true,
         isDM: meta.isDM === true,
+        // agent-framework stores `origin` (not message metadata) as the
+        // stored message's metadata on this path, so the attribution stamp
+        // rides here too, or a host strategy cannot tell the payload already
+        // names its author.
+        ...(meta.attributed === true ? { attributed: true, attributionHeader: meta.attributionHeader } : {}),
         ...(missed ? { missedMessages: missed.messages, missedCharacters: missed.characters } : {}),
         ...extraOrigin,
       },
@@ -1568,12 +1592,6 @@ export class ZulipMcplServer {
     if (!conn) throw new Error('not connected');
     return (await conn.sendRequest(method.CHANNELS_INCOMING, { messages })) as ChannelsIncomingResult | undefined;
   }
-}
-
-function defaultTimeFormatter(): (d: Date) => string {
-  const zone = resolveAgentTimeZone();
-  const style = resolveTimestampStyle();
-  return (d) => formatAgentDateTime(d, zone, style);
 }
 
 /** A message's cursor id; null for reactions and system markers, which have none. */

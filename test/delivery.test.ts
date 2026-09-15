@@ -11,7 +11,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { IncomingChannelMessage } from '@animalabs/mcpl-core';
-import { DeliveryState, renderMissedBlock, selectMissed, viewOf, type MissedView } from '../src/delivery.ts';
+import { DeliveryState, attributeMessage, renderMissedBlock, selectMissed, viewOf, type MissedView } from '../src/delivery.ts';
 
 function tmp(): string {
   return mkdtempSync(join(tmpdir(), 'zulip-delivery-'));
@@ -203,8 +203,8 @@ test('renderMissedBlock leads with ids, flags mentions, and reports counts by re
   });
   const lines = block.split('\n');
   assert.equal(lines[0], '<missed stream="#general" channelId="zulip:general" count="1" lines="3" reason="mention">');
-  assert.equal(lines[1], '[12:00 id=1] [topic-a] Ann: context');
-  assert.equal(lines[2], '[12:00 id=2] [topic-a] Ann (mention): ping [attachments: shot.png]');
+  assert.equal(lines[1], '[12:00 id=1] [#general > topic-a] Ann: context');
+  assert.equal(lines[2], '[12:00 id=2] [#general > topic-a] Ann (mention): ping [attachments: shot.png]');
   assert.equal(lines[4], '</missed>');
 
   const backscroll = renderMissedBlock(views, {
@@ -260,5 +260,75 @@ test('renderMissedBlock: the budget is a hard cap on the whole block, one long l
     streamName: 'general', channelId: 'zulip:general', reason: 'mention', count: 1, formatTime: () => '', maxChars: 1000,
   });
   assert.ok(huge.length <= 1000, `block is ${huge.length} chars`);
-  assert.match(huge, /^<missed stream="#general" channelId="zulip:general" count="1" lines="1" reason="mention">\n\[id=7\] \[topic-a\] Ann \(mention\): z+ … \[line cut to fit the catch-up budget — fetch_around\(7\) has the whole message\]\n<\/missed>$/);
+  assert.match(huge, /^<missed stream="#general" channelId="zulip:general" count="1" lines="1" reason="mention">\n\[id=7\] \[#general > topic-a\] Ann \(mention\): z+ … \[line cut to fit the catch-up budget — fetch_around\(7\) has the whole message\]\n<\/missed>$/);
+});
+
+// ── attributeMessage ──
+
+function incoming(over: Partial<IncomingChannelMessage> = {}): IncomingChannelMessage {
+  return {
+    channelId: 'zulip:qa',
+    messageId: '17206924',
+    threadId: 'router',
+    author: { id: '760', name: 'Mykhailo Buialo' },
+    timestamp: '2026-09-14T08:42:52.000Z',
+    content: [{ type: 'text', text: '@Knowledge Resident do you have the same issue' }],
+    tags: ['chat:mention', 'chat:from-human'],
+    metadata: { topic: 'router', mentioned: true, isDM: false },
+    ...over,
+  };
+}
+
+test('attributeMessage renders who/where/when into the body in the fetch_history line shape, and keeps the fields', () => {
+  const out = attributeMessage(incoming(), () => '2026-09-14T08:42:52Z');
+  assert.equal((out.content[0] as { text: string }).text, '[2026-09-14T08:42:52Z id=17206924] [#qa > router] Mykhailo Buialo (mention): @Knowledge Resident do you have the same issue');
+  assert.deepEqual(out.author, { id: '760', name: 'Mykhailo Buialo' });
+  assert.equal(out.threadId, 'router');
+  assert.equal((out.metadata as { topic: string }).topic, 'router');
+  assert.equal((out.metadata as { attributed: boolean }).attributed, true);
+  assert.equal((out.metadata as { attributionHeader: string }).attributionHeader, '[2026-09-14T08:42:52Z id=17206924] [#qa > router] Mykhailo Buialo (mention): ', 'the exact prefix, so a host can strip it');
+  assert.equal((out.content[0] as { text: string }).text.startsWith((out.metadata as { attributionHeader: string }).attributionHeader), true);
+
+  // Ambient (no mention) has no marker; a DM says so instead of stream > topic.
+  assert.equal((attributeMessage(incoming({ metadata: { topic: 'router', mentioned: false } }), () => 'T').content[0] as { text: string }).text.startsWith('[T id=17206924] [#qa > router] Mykhailo Buialo: @'), true);
+  const dm = attributeMessage(incoming({ channelId: 'zulip:dm:760', threadId: undefined, metadata: { isDM: true, mentioned: false }, content: [{ type: 'text', text: 'hi' }] }), () => 'T');
+  assert.equal((dm.content[0] as { text: string }).text, '[T id=17206924] [DM] Mykhailo Buialo: hi');
+});
+
+test('attributeMessage: no timestamp style, attachments after the body, image-only content, and idempotence', () => {
+  const none = attributeMessage(incoming(), () => '');
+  assert.equal((none.content[0] as { text: string }).text.startsWith('[id=17206924] [#qa > router]'), true, 'AGENT_TIMESTAMP_STYLE=none drops the time, not the id');
+
+  const withNote = attributeMessage(incoming({ content: [{ type: 'text', text: 'see file' }, { type: 'text', text: '[attachments: 1]\n- a.pdf' }] }), () => 'T');
+  assert.equal((withNote.content[0] as { text: string }).text, '[T id=17206924] [#qa > router] Mykhailo Buialo (mention): see file');
+  assert.equal((withNote.content[1] as { text: string }).text, '[attachments: 1]\n- a.pdf', 'the note is untouched');
+
+  const imageOnly = attributeMessage(incoming({ content: [{ type: 'image', data: 'AAAA', mimeType: 'image/png' }] }), () => 'T');
+  assert.equal((imageOnly.content[0] as { text: string }).text, '[T id=17206924] [#qa > router] Mykhailo Buialo (mention):');
+  assert.equal((imageOnly.metadata as { attributionHeader: string }).attributionHeader, '[T id=17206924] [#qa > router] Mykhailo Buialo (mention):', 'the recorded prefix is what was inserted');
+  assert.equal(imageOnly.content[1].type, 'image');
+
+  const original = incoming();
+  const once = attributeMessage(original, () => 'T');
+  assert.deepEqual(attributeMessage(once, () => 'T'), once, 'a replay does not double the header');
+  assert.equal(viewOf(original).text, '@Knowledge Resident do you have the same issue', 'the input is not mutated');
+  assert.equal((original.metadata as { attributed?: boolean }).attributed, undefined);
+
+  const bad = attributeMessage(incoming({ timestamp: 'not-a-date' }), () => { throw new Error('must not format an invalid date'); });
+  assert.equal((bad.content[0] as { text: string }).text.startsWith('[id=17206924] '), true, 'an unparseable timestamp drops the time, not the message');
+});
+
+test('renderMissedBlock on a DM conversation renders [DM] lines, with no mention mark though every DM line is selected as addressed', () => {
+  const dmMsg = (id: number, text: string): IncomingChannelMessage => ({
+    channelId: 'zulip:dm:42',
+    messageId: String(id),
+    author: { id: '42', name: 'Bo' },
+    timestamp: new Date(1_700_000_000_000).toISOString(),
+    content: [{ type: 'text', text }],
+    metadata: { isDM: true, mentioned: false },
+  });
+  const views = [viewOf(dmMsg(1, 'hey')), viewOf(dmMsg(2, 'you there?'))];
+  assert.equal(views[0].mentioned, true, 'selection still treats a DM as addressed');
+  const block = renderMissedBlock(views, { streamName: 'DM: Bo', channelId: 'zulip:dm:42', reason: 'mention', count: 2, formatTime: () => 'T' });
+  assert.deepEqual(block.split('\n').slice(1, 3), ['[T id=1] [DM] Bo: hey', '[T id=2] [DM] Bo: you there?']);
 });

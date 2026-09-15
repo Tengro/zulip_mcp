@@ -32,6 +32,8 @@ import type {
 } from './adapter.js';
 import { ZulipEventLoop } from './zulip-events.js';
 import { chunkMessage } from '../content.js';
+import { messageLineHead } from '../message-line.js';
+import { agentLineTimeFormatter } from '../timezone.js';
 import { uploadBlocks, withAttachmentLinks, type UploadPolicy, type Uploader } from '../uploads.js';
 import {
   assertApiSuccess,
@@ -103,6 +105,8 @@ export interface ZulipAdapterOptions {
   uploader?: Uploader;
   /** Size and count limits for those uploads. Required with `uploader`. */
   uploadPolicy?: UploadPolicy;
+  /** Line time for the recent history injected before inference (default: the agent line time from env). */
+  formatTime?: (d: Date) => string;
 }
 
 export const DEFAULT_BACKSCROLL = 500;
@@ -120,6 +124,7 @@ export class ZulipAdapter implements PlatformAdapter {
   private readonly maxMessageLength: number | undefined;
   private readonly uploader: Uploader | null;
   private readonly uploadPolicy: UploadPolicy | null;
+  private readonly formatTime: (d: Date) => string;
   /** DM conversations already described to the server, by channel id. */
   private knownDms = new Map<string, ChannelDescriptor>();
   /** Recently seen messages, so a reaction can be placed without a round
@@ -141,6 +146,7 @@ export class ZulipAdapter implements PlatformAdapter {
     this.maxMessageLength = options.maxMessageLength;
     this.uploader = options.uploader ?? null;
     this.uploadPolicy = options.uploadPolicy ?? null;
+    this.formatTime = options.formatTime ?? agentLineTimeFormatter();
     if (this.uploader && !this.uploadPolicy) throw new Error('ZulipAdapter: uploader needs an uploadPolicy');
   }
 
@@ -390,12 +396,16 @@ export class ZulipAdapter implements PlatformAdapter {
     const messages = page.messages.filter((m) => this.allowed(m));
     if (messages.length === 0) return null;
 
-    const formatted = messages.map((m) => {
-      const time = m.timestamp.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
-      return dmIds
-        ? `[${time}] ${m.authorName}: ${m.cleanContent}`
-        : `[${time}] [${m.topic}] ${m.authorName}: ${m.cleanContent}`;
-    }).join('\n');
+    // The shared line shape, so injected history reads like live delivery
+    // and every line carries an id the agent can fetch_around.
+    const formatted = messages.map((m) => messageLineHead({
+      id: m.id,
+      time: Number.isNaN(m.timestamp.getTime()) ? '' : this.formatTime(m.timestamp),
+      stream: dmIds ? null : (m.streamName ?? streamNameOf(channelId)),
+      topic: m.topic,
+      author: m.authorName,
+      mentioned: m.mentioned,
+    }) + m.cleanContent).join('\n');
 
     const label = dmIds ? `the direct-message conversation ${channelId}` : `Zulip #${streamNameOf(channelId)}`;
     return {

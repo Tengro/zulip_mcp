@@ -26,6 +26,8 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { IncomingChannelMessage, TextContent } from '@animalabs/mcpl-core';
+import { isDmChannelId } from './history.js';
+import { messageLineHead } from './message-line.js';
 
 export interface MissedTally {
   /** Watermark at the moment the channel was closed (0 = none known). */
@@ -339,6 +341,41 @@ export function viewOf(m: IncomingChannelMessage): MissedView {
   };
 }
 
+/**
+ * Render the who/where/when of a message into its body in the shared line
+ * shape (see message-line.ts), so the model sees
+ * `[<time> id=N] [#stream > topic] Author (mention): text` and not a bare
+ * body. The structured fields (author, threadId, metadata) travel too;
+ * agent-framework's context strategies render the content blocks only, and
+ * an agent that reads "ship it?" with no author cannot tell who asked.
+ *
+ * Stamps `metadata.attributed: true` and `metadata.attributionHeader` (the
+ * exact prefix added), so a host strategy that renders its own provenance
+ * header can skip it, and one that scans message text can strip the prefix
+ * first. Idempotent on the flag, so a replay cannot double the header.
+ */
+export function attributeMessage(m: IncomingChannelMessage, formatTime: (d: Date) => string): IncomingChannelMessage {
+  const meta = (typeof m.metadata === 'object' && m.metadata !== null ? m.metadata : {}) as Record<string, unknown>;
+  if (meta.attributed === true) return m;
+  const isDM = meta.isDM === true || isDmChannelId(m.channelId);
+  const at = new Date(m.timestamp);
+  const header = messageLineHead({
+    id: m.messageId,
+    time: Number.isNaN(at.getTime()) ? '' : formatTime(at),
+    stream: isDM ? null : (m.channelId.startsWith('zulip:') ? m.channelId.slice('zulip:'.length) : m.channelId),
+    topic: typeof meta.topic === 'string' ? meta.topic : (m.threadId ?? ''),
+    author: m.author.name,
+    mentioned: meta.mentioned === true,
+  });
+  const index = m.content.findIndex((c) => c.type === 'text');
+  const content = [...m.content];
+  // `prefix` is exactly what was added, so a consumer can strip it verbatim.
+  const prefix = index < 0 ? header.trimEnd() : header;
+  if (index < 0) content.unshift({ type: 'text', text: prefix });
+  else content[index] = { type: 'text', text: prefix + (content[index] as TextContent).text };
+  return { ...m, content, metadata: { ...meta, attributed: true, attributionHeader: prefix } };
+}
+
 /** Messages around each mention, ±`vicinity` by count (robust to channel pace). */
 export function selectMissed<T extends { mentioned: boolean }>(
   msgs: T[],
@@ -388,11 +425,18 @@ function historyPointer(channelId: string, cursor: 'before' | 'after', id: numbe
  * newest line is itself over budget it is cut and says so.
  */
 export function renderMissedBlock(msgs: MissedView[], opts: MissedBlockOptions): string {
+  const dm = isDmChannelId(opts.channelId);
   const render = (m: MissedView): string => {
-    const ts = opts.formatTime(m.timestamp);
     const att = m.attachmentNames.length > 0 ? ` [attachments: ${m.attachmentNames.join(', ')}]` : '';
-    const mark = m.mentioned ? ' (mention)' : '';
-    return `[${ts ? `${ts} ` : ''}id=${m.id}] [${m.topic}] ${m.authorName}${mark}: ${m.text}${att}`;
+    const head = messageLineHead({
+      id: m.id,
+      time: Number.isNaN(m.timestamp.getTime()) ? '' : opts.formatTime(m.timestamp),
+      stream: dm ? null : opts.streamName,
+      topic: m.topic,
+      author: m.authorName,
+      mentioned: m.mentioned,
+    });
+    return `${head}${m.text}${att}`;
   };
   const lines = msgs.map(render);
   const budget = opts.maxChars ?? Infinity;

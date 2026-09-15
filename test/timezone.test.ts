@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { formatAgentDateTime, isValidTimeZone, resolveAgentTimeZone, resolveTimestampStyle } from '../src/timezone.ts';
+import { agentLineTimeFormatter, formatAgentDateTime, isValidTimeZone, resolveAgentTimeZone, resolveTimestampStyle } from '../src/timezone.ts';
 
 function capturing(fn: () => void): string[] {
   const warnings: string[] = [];
@@ -64,4 +64,14 @@ test('resolveTimestampStyle accepts valid styles case-insensitively and falls ba
   });
   assert.equal(warnings.length, 1);
   assert.ok(warnings[0].includes('AGENT_TIMESTAMP_STYLE'));
+});
+
+test('the message-line time drops the zone name from full (the offset stays), keeps the other styles, and never throws', () => {
+  const d = new Date('2026-09-14T08:42:52Z');
+  assert.equal(agentLineTimeFormatter({ AGENT_TIMEZONE: 'Europe/Kyiv' })(d), '2026-09-14T11:42:52+03:00');
+  assert.equal(agentLineTimeFormatter({ AGENT_TIMEZONE: 'UTC', AGENT_TIMESTAMP_STYLE: 'compact' })(d), '2026-09-14 08:42');
+  assert.equal(agentLineTimeFormatter({ AGENT_TIMEZONE: 'UTC', AGENT_TIMESTAMP_STYLE: 'none' })(d), '');
+  assert.equal(agentLineTimeFormatter({ AGENT_TIMEZONE: 'UTC' })(new Date('not a date')), '');
+  // formatAgentDateTime's own default is unchanged.
+  assert.equal(formatAgentDateTime(d, 'UTC'), '2026-09-14T08:42:52+00:00 [UTC]');
 });
