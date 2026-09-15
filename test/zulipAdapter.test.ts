@@ -93,6 +93,9 @@ test('fetchContext injects nothing for a stream outside the allowlist, and only 
   const injection = await adapter.fetchContext('zulip:dm:7+42', undefined, 5);
   assert.ok(injection);
   assert.match(injection!.content, /Bo: m5/);
+  const timed = new ZulipAdapter(client, SELF, 's', { filters: onlyDev, formatTime: () => 'T' });
+  const lines = (await timed.fetchContext('zulip:dm:7+42', undefined, 5))!.content.split('\n');
+  assert.deepEqual(lines.slice(1), ['[T id=5] [DM] Bo: m5', '[T id=6] [DM] Bot: m6'], 'injected history uses the shared line shape, ids included');
   assert.match(injection!.content, /Bot: m6/, 'the bot\'s own turns stay in context');
   assert.doesNotMatch(injection!.content, /Ann: m4/);
 });

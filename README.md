@@ -87,12 +87,12 @@ are likely to touch:
 | `ZULIP_SUPPRESSED_REACTIONS_BASELINE` | `DISCORD_SUPPRESSED_REACTIONS_BASELINE` | Host-owned reaction markers withheld from the model; re-read every start, never persisted (connectome-host injects the `DISCORD_` name into every MCPL child) |
 | `ZULIP_CATCHUP_LIMIT` | 3000 | Per-channel ceiling for catch-up and gap recovery (max 10000). For an always-open desk channel a few hundred is plenty |
 | `ZULIP_MISSED_BLOCK_MAX_CHARS` | 40000 | Size cap on one `<missed>` block; the oldest lines are elided with a `fetch_history` pointer |
-| `ZULIP_ATTRIBUTE_DELIVERY` | true | Render `[time id=N] [#stream > topic] Author: ` into every delivered body; `false` for a host that renders the structured fields itself |
+| `ZULIP_ATTRIBUTE_DELIVERY` | true | Prefix live, pushed and recovered bodies with `[time id=N] [#stream > topic] Author: `; `false` for a host that renders the structured fields itself (see *What the model reads*) |
 | `ZULIP_BACKSCROLL_DEFAULT`, `ZULIP_BACKSCROLL_CHANNELS` | 500 | History cap on `channels/open`, per stream as `general:50,dev:200` |
 | `ZULIP_INLINE_IMAGES`, `ZULIP_INLINE_IMAGES_MAX`, `ZULIP_ATTACHMENT_INLINE_MAX_BYTES` | true, 4, 5120 | Attachment inlining on live delivery |
 | `ZULIP_UPLOAD_ROOTS` | — | Named directories local-file attachments may come from, `notes=./notes,out=/srv/out`. Unset: local files refused, base64 only |
 | `ZULIP_UPLOAD_MAX_BYTES` | realm's cap, else 25 MiB | Per-file ceiling for outbound uploads; the realm's `max_file_upload_size_mib` is read at start. A message carries at most 10 files within 4× this |
-| `AGENT_TIMEZONE`, `AGENT_TIMESTAMP_STYLE` | system, `full` | Agent-visible timestamps in catch-up blocks |
+| `AGENT_TIMEZONE`, `AGENT_TIMESTAMP_STYLE` | system, `full` | Agent-visible time on every message line: delivery, `<missed>`, injected history, `fetch_history` |
 | `MCPL_ENABLED` | true | `false` forces plain-MCP mode even for MCPL hosts |
 
 ### Plain MCP client (Claude Code, Cursor)
@@ -275,24 +275,51 @@ history line, `<missed>` block, and incoming message leads with one so the
 agent can `fetch_around` it.
 
 **What the model reads.** A delivered message carries its author, topic and
-id as structured fields, but hosts render only the content blocks, so the
-body itself leads with them, in the shape of a `fetch_history` line:
-`[<time> id=N] [#stream > topic] Author (mention): text`, or `[DM]` in place
-of the stream and topic. The time follows `AGENT_TIMEZONE` /
-`AGENT_TIMESTAMP_STYLE` like the `<missed>` block (`none` keeps the id;
-`fetch_history` itself prints UTC). This applies to live delivery
-(`channels/incoming` and `push/event`), to messages recovered onto an open
-channel after a gap or a refused batch, and to the backscroll returned on
-`channels/open`; the reply affordance on a new DM precedes it, and the
-attachment note and inlined images follow it. The header is not escaped:
-a name or topic containing `]: ` reads ambiguously to a regex, as it does
-on every other surface. A host that renders the structured fields itself
-sets `ZULIP_ATTRIBUTE_DELIVERY=false` and gets bare bodies. connectome-host
-does so under its `frontdesk` context strategy (the `clerk` recipe), which
-prepends `[zulip · #stream · topic "t" · @Author · time · msg N]` from the
-metadata; a recipe on that strategy sets the variable to `false` in the
-server's env or the model reads two headers. `autobiographical` and
-`passthrough` render nothing, and want the default.
+id as structured fields, but agent-framework's context strategies render
+only the content blocks, so the body itself leads with them. Every place the
+model reads a Zulip message line uses one shape: live delivery
+(`channels/incoming`, `push/event`), messages recovered onto an open channel
+after a gap or a refused batch, the `<missed>` catch-up block, the recent
+history injected before inference, and `fetch_history` / `fetch_around`:
+
+```
+[2026-09-14T11:42:52+03:00 id=17206924] [#qa > router] Mykhailo Buialo (mention): do you have the same issue
+[2026-09-14T11:42:52+03:00 id=17206925] [DM] Bo: hey, got a minute?
+```
+
+The time follows `AGENT_TIMEZONE` / `AGENT_TIMESTAMP_STYLE`; `full` drops its
+`[Zone]` suffix on these lines (the offset fixes the instant), and `none`
+keeps the id. `(mention)` marks a stream message that mentions the bot; a
+direct message says `[DM]` instead. The reply affordance on a new DM precedes
+the line; the attachment note and inlined images follow it. Header fields are
+folded onto one line but not escaped, so a topic containing `]: ` reads
+ambiguously to a regex. The backscroll returned on `channels/open` is not
+prefixed: the host hands it to the agent as the `channel_open` tool result,
+JSON that already shows each message's author and topic. The legacy
+`get_channel_history` / `get_unread_messages` formats are unchanged.
+
+**Hosts that render provenance themselves.** A prefixed message is stamped
+`attributed: true` with `attributionHeader` (the exact prefix added) in its
+metadata, and in the `push/event` origin, which agent-framework stores as the
+message metadata on that path. A host strategy that builds its own
+provenance header can skip it when the stamp is present, and one that scans
+message text can strip the prefix first. connectome-host's `frontdesk`
+strategy renders such a header (`[zulip · #stream · topic "t" · @Author ·
+time · msg N]`); a frontdesk that does not yet honour the stamp shows both.
+A host that renders the fields itself and cannot read the stamp sets
+`ZULIP_ATTRIBUTE_DELIVERY=false` for bare bodies, in the environment the
+server actually starts with: under connectome-host that is the host's own
+environment or the `env` of the server's entry in `mcpl-servers.json`. A
+recipe's `env` reaches the server only when the recipe defines the server
+itself (`command` or `url`); for a server defined in `mcpl-servers.json` it
+is not merged.
+
+**Gate filters see the prefix.** agent-framework's wake gate matches a
+policy's `match.filter` (substring or regex) against the joined text of the
+message, which now starts with the line head. A pattern anchored with `^` on
+the body stops matching, and a keyword that also appears in a stream, topic
+or author name matches every message there. Anchor on the body after the
+head (`\] [^:]*: pattern`), or match on channel, scope or tags instead.
 
 ## State on disk
 

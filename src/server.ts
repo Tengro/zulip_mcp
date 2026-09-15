@@ -59,7 +59,7 @@ import { isDmChannelId } from './history.js';
 import type { FiltersPlane } from './filters.js';
 import { buildAttachmentBlocks, type AttachmentSource, type InlineOptions } from './attachments.js';
 import type { AttachmentRef } from './content.js';
-import { formatAgentDateTime, resolveAgentTimeZone, resolveTimestampStyle } from './timezone.js';
+import { agentLineTimeFormatter } from './timezone.js';
 import { CapabilityGrant } from './grant.js';
 import { StateTracker } from './state.js';
 import type { PlatformAdapter, PlatformSystemEvent, ReactionEvent } from './platforms/adapter.js';
@@ -112,7 +112,7 @@ export interface ZulipMcplServerOptions {
   attachments?: { source: AttachmentSource; inline: InlineOptions };
   /** Size cap (characters) on one `<missed>` catch-up block; the oldest lines are elided. */
   missedBlockMaxChars?: number;
-  /** Render `[time id=N] [#stream > topic] Author: ` into every delivered body (default true). `false` for a host that renders the structured fields itself. */
+  /** Render `[time id=N] [#stream > topic] Author: ` into delivered bodies (live, push, recovered replays; default true). `false` for a host that renders the structured fields itself. */
   attributeDelivery?: boolean;
 }
 
@@ -156,7 +156,7 @@ export class ZulipMcplServer {
     this.adapters = new Map([[adapter.type, adapter]]);
     this.catchupLimit = Math.min(CATCHUP_HARD_CAP, Math.max(0, options.catchupLimit ?? DEFAULT_CATCHUP_LIMIT));
     this.missedBlockMaxChars = Math.max(1000, options.missedBlockMaxChars ?? DEFAULT_MISSED_BLOCK_MAX_CHARS);
-    this.formatTime = options.formatTime ?? defaultTimeFormatter();
+    this.formatTime = options.formatTime ?? agentLineTimeFormatter();
     this.attributeDelivery = options.attributeDelivery !== false;
     this.filters = options.filters ?? null;
     this.delivery = new DeliveryState(options.stateDir ?? null, options.sessionId ?? 'default');
@@ -670,7 +670,9 @@ export class ZulipMcplServer {
         afterMessageId:
           params.history?.sinceLastSeen && watermark !== undefined ? String(watermark) : undefined,
       });
-      result.history = this.projectHistoryReactions(page.messages).map((m) => this.attributed(m));
+      // Not attributed: the host hands this back as the channel_open tool
+      // result, JSON that already shows author, threadId and metadata.
+      result.history = this.projectHistoryReactions(page.messages);
       result.historyTruncated = requested > limit;
       // Handed to the host in this very response: forwarded.
       for (const m of page.messages) this.accepted(descriptor.id, Number(m.messageId));
@@ -1004,6 +1006,11 @@ export class ZulipMcplServer {
         authorName: message.author.name,
         isMention: meta.mentioned === true,
         isDM: meta.isDM === true,
+        // agent-framework stores `origin` (not message metadata) as the
+        // stored message's metadata on this path, so the attribution stamp
+        // rides here too, or a host strategy cannot tell the payload already
+        // names its author.
+        ...(meta.attributed === true ? { attributed: true, attributionHeader: meta.attributionHeader } : {}),
         ...(missed ? { missedMessages: missed.messages, missedCharacters: missed.characters } : {}),
         ...extraOrigin,
       },
@@ -1585,12 +1592,6 @@ export class ZulipMcplServer {
     if (!conn) throw new Error('not connected');
     return (await conn.sendRequest(method.CHANNELS_INCOMING, { messages })) as ChannelsIncomingResult | undefined;
   }
-}
-
-function defaultTimeFormatter(): (d: Date) => string {
-  const zone = resolveAgentTimeZone();
-  const style = resolveTimestampStyle();
-  return (d) => formatAgentDateTime(d, zone, style);
 }
 
 /** A message's cursor id; null for reactions and system markers, which have none. */

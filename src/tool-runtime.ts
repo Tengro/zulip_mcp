@@ -20,6 +20,8 @@ import {
 import type { ZulipSession } from "./zulip-client.js";
 import { assertApiSuccess, dmChannelIdFor, fetchAround, fetchHistory, parseDmChannelId, renderReactions, type ReactionSummary, type ZulipMessage } from "./history.js";
 import { chunkMessage } from "./content.js";
+import { messageLineHead } from "./message-line.js";
+import { agentLineTimeFormatter } from "./timezone.js";
 import {
   attachmentMarkdown,
   createZulipUploader,
@@ -164,25 +166,38 @@ function numberOrUndefined(value: unknown): number | undefined {
   return undefined;
 }
 
+/** UTC ISO seconds -- the line time when no agent formatter is supplied. */
+export function utcLineTime(d: Date): string {
+  return Number.isNaN(d.getTime()) ? "" : d.toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
 /**
- * One line per message, id first so the agent can fetch_around(id). The
- * anchor of a fetch_around window is marked so it stands out.
+ * One line per message in the shared line shape (message-line.ts), id first
+ * so the agent can fetch_around(id). The anchor of a fetch_around window is
+ * marked so it stands out. The runtime passes the agent line-time formatter,
+ * so these lines read the same as live delivery and the `<missed>` block.
  */
 export function formatHistoryLines(
   messages: ZulipMessage[],
   anchorId?: number,
   policy: ReactionPolicy = SHOW_ALL,
   selfUserId: number | null = null,
+  formatTime: (d: Date) => string = utcLineTime,
 ): string {
   if (messages.length === 0) return "(no messages)";
   return messages.map((m) => {
-    const ts = m.timestamp.toISOString().replace(/\.\d{3}Z$/, "Z");
-    const where = m.isDm ? "[DM]" : `[#${m.streamName} > ${m.topic}]`;
+    const head = messageLineHead({
+      id: m.id,
+      time: Number.isNaN(m.timestamp.getTime()) ? "" : formatTime(m.timestamp),
+      stream: m.isDm ? null : (m.streamName ?? ""),
+      topic: m.topic,
+      author: m.authorName,
+      mentioned: m.mentioned,
+    });
     const mark = m.id === anchorId ? " <<" : "";
-    const mention = m.mentioned ? " (mention)" : "";
     const att = m.attachments.length > 0 ? ` [attachments: ${m.attachments.map((a) => a.path).join(", ")}]` : "";
     const reactions = renderReactions(projectReactions(m.reactions, policy), selfUserId);
-    return `[${ts} id=${m.id}] ${where} ${m.authorName}${mention}: ${m.cleanContent}${att}${reactions}${mark}`;
+    return `${head}${m.cleanContent}${att}${reactions}${mark}`;
   }).join("\n");
 }
 
@@ -210,14 +225,17 @@ export class ZulipToolRuntime {
 
   private readonly uploader: Uploader | null;
   private readonly uploadPolicy: UploadPolicy;
+  /** Line time for fetch_history / fetch_around, shared with live delivery. */
+  private readonly formatTime: (d: Date) => string;
 
   constructor(
     private readonly session: ZulipSession,
     private readonly stateDir: string = STATE_DIR,
-    options: { uploader?: Uploader; uploadPolicy?: UploadPolicy } = {},
+    options: { uploader?: Uploader; uploadPolicy?: UploadPolicy; formatTime?: (d: Date) => string } = {},
   ) {
     this.zulipClient = session.client;
     this.sessionId = session.sessionId;
+    this.formatTime = options.formatTime ?? agentLineTimeFormatter();
     this.uploader = options.uploader ?? (session.realm ? createZulipUploader(session) : null);
     this.uploadPolicy = options.uploadPolicy ?? resolveUploadPolicy(process.env, session.maxUploadBytes);
     this.loadState();
@@ -822,7 +840,7 @@ export class ZulipToolRuntime {
           newest_id: page.messages[page.messages.length - 1]?.id ?? null,
           reached_oldest: page.foundOldest,
           reached_newest: page.foundNewest,
-          formatted_history: formatHistoryLines(page.messages, undefined, this.reactionPolicy, this.session.selfUserId),
+          formatted_history: formatHistoryLines(page.messages, undefined, this.reactionPolicy, this.session.selfUserId, this.formatTime),
         };
       }
 
@@ -840,7 +858,7 @@ export class ZulipToolRuntime {
           count: page.messages.length,
           oldest_id: page.messages[0]?.id ?? null,
           newest_id: page.messages[page.messages.length - 1]?.id ?? null,
-          formatted_history: formatHistoryLines(page.messages, messageId, this.reactionPolicy, this.session.selfUserId),
+          formatted_history: formatHistoryLines(page.messages, messageId, this.reactionPolicy, this.session.selfUserId, this.formatTime),
         };
       }
 

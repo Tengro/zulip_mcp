@@ -52,6 +52,7 @@ import { DEFAULT_CATCHUP_LIMIT, ZulipMcplServer } from './server.js';
 import { DEFAULT_MISSED_BLOCK_MAX_CHARS } from './delivery.js';
 import { ZulipToolRuntime } from './tool-runtime.js';
 import { LOCAL_FILES_SUPPORTED, createZulipUploader, resolveUploadPolicy } from './uploads.js';
+import { agentLineTimeFormatter } from './timezone.js';
 import { initializeZulipClient } from './zulip-client.js';
 
 export { fetchAttachmentBytes, extractZulipAttachments, cleanContent } from './content.js';
@@ -109,7 +110,10 @@ async function main(): Promise<void> {
     console.error(`[zulip-mcp] upload roots: ${[...uploadPolicy.roots].map(([n, d]) => `${n}=${d}`).join(', ')}`);
     if (!LOCAL_FILES_SUPPORTED) console.error(`[zulip-mcp] ZULIP_UPLOAD_ROOTS is set but local-file attachments are Linux-only on this platform (${process.platform}); base64 data still works`);
   }
+  // One line-time formatter for every surface (and one warning for a bad AGENT_TIMEZONE).
+  const formatTime = agentLineTimeFormatter();
   const adapter = new ZulipAdapter(session.client, session.selfUserId, session.sessionId, {
+    formatTime,
     uploader,
     uploadPolicy,
     backscrollDefault: intEnv('ZULIP_BACKSCROLL_DEFAULT', DEFAULT_BACKSCROLL),
@@ -117,7 +121,7 @@ async function main(): Promise<void> {
     filters,
     maxMessageLength: process.env.ZULIP_MAX_MESSAGE_LENGTH ? intEnv('ZULIP_MAX_MESSAGE_LENGTH', 10000) : undefined,
   });
-  const tools = new ZulipToolRuntime(session, stateDir, { uploader, uploadPolicy });
+  const tools = new ZulipToolRuntime(session, stateDir, { uploader, uploadPolicy, formatTime });
   tools.setReactionPolicy({
     suppressed: (name, code, type) => filters.reactionSuppressed(name, code, type),
   });
@@ -131,6 +135,7 @@ async function main(): Promise<void> {
     catchupLimit: intEnv('ZULIP_CATCHUP_LIMIT', DEFAULT_CATCHUP_LIMIT),
     missedBlockMaxChars: intEnv('ZULIP_MISSED_BLOCK_MAX_CHARS', DEFAULT_MISSED_BLOCK_MAX_CHARS),
     attributeDelivery: process.env.ZULIP_ATTRIBUTE_DELIVERY !== 'false',
+    formatTime,
     filters,
     attachments: {
       // Same validation as fetch_attachment: only /user_uploads/ on the realm
