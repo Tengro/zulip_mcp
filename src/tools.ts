@@ -153,7 +153,8 @@ export const toolDefinitions: ToolDefinition[] = [
   {
     name: "send_message",
     description:
-      "Send a message to a stream or as a direct message. For streams, provide 'stream' and 'topic'. For DMs, provide 'to' as user email(s).",
+      "Send a message to a stream or as a direct message. For streams, provide 'stream' and 'topic'. For DMs, provide 'to' as user email(s). " +
+      "Pass 'attachments' to send files (root-relative paths under a configured upload root, or base64) with the message.",
     inputSchema: {
       type: "object",
       properties: {
@@ -172,10 +173,27 @@ export const toolDefinitions: ToolDefinition[] = [
         },
         content: {
           type: "string",
-          description: "The message content (supports Markdown)",
+          description: "The message content (supports Markdown). May be empty when attachments are given.",
+        },
+        attachments: {
+          type: "array",
+          description:
+            "Files to attach (max 10). Each entry is either { file: '<root>/<path>' } — a file under one of the server's configured " +
+            "upload roots, e.g. 'notes/report.pdf'; absolute paths are refused and with no roots configured local files are unavailable — " +
+            "or { data: '<base64>', name: 'report.pdf' }. Optional mime_type on either (guessed from the extension otherwise). " +
+            "Files are uploaded to Zulip first, then linked at the end of the message (images get a preview). With attachments, content may be empty.",
+          items: {
+            type: "object",
+            properties: {
+              file: { type: "string", description: "Root-relative path: <root>/<path> under a configured upload root" },
+              data: { type: "string", description: "Base64-encoded bytes (requires name)" },
+              name: { type: "string", description: "Filename shown in Zulip" },
+              mime_type: { type: "string", description: "MIME type (optional)" },
+            },
+          },
         },
       },
-      required: ["type", "to", "content"],
+      required: ["type", "to"],
     },
   },
   {
@@ -193,9 +211,40 @@ export const toolDefinitions: ToolDefinition[] = [
           items: { type: "string" },
           description: "One or more recipients: full name, email, or user id each",
         },
-        content: { type: "string", description: "The message content (supports Markdown)" },
+        content: { type: "string", description: "The message content (supports Markdown). May be empty when attachments are given." },
+        attachments: {
+          type: "array",
+          description:
+            "Files to attach (max 10): { file: '<root>/<path>' } (under a configured upload root, e.g. 'notes/report.pdf') " +
+            "or { data: '<base64>', name: 'x.pdf' } each, optional mime_type. Uploaded first, then linked at the end of the message.",
+          items: {
+            type: "object",
+            properties: {
+              file: { type: "string", description: "Root-relative path: <root>/<path> under a configured upload root" },
+              data: { type: "string", description: "Base64-encoded bytes (requires name)" },
+              name: { type: "string", description: "Filename shown in Zulip" },
+              mime_type: { type: "string", description: "MIME type (optional)" },
+            },
+          },
+        },
       },
-      required: ["to", "content"],
+      required: ["to"],
+    },
+  },
+  {
+    name: "upload_file",
+    description:
+      "Upload a file to Zulip without sending a message. Returns the `/user_uploads/...` path, the absolute url, and " +
+      "the markdown link to embed in any message body (send_message, send_dm, edit_message). Use send_message's " +
+      "'attachments' instead when the file simply goes with a new message.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        file: { type: "string", description: "Root-relative path: <root>/<path> under a configured upload root (never absolute)" },
+        data: { type: "string", description: "Base64-encoded bytes (alternative to file; requires name)" },
+        name: { type: "string", description: "Filename shown in Zulip (defaults to the file's basename)" },
+        mime_type: { type: "string", description: "MIME type (optional)" },
+      },
     },
   },
   {

@@ -8,11 +8,12 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ZulipToolRuntime, stripSuppressedReactions } from '../src/tool-runtime.ts';
 import type { ZulipSession } from '../src/zulip-client.ts';
+import { LOCAL_FILES_SUPPORTED, type UploadPolicy } from '../src/uploads.ts';
 
 function runtime(client: Record<string, unknown>): { tools: ZulipToolRuntime; dir: string } {
   const dir = mkdtempSync(join(tmpdir(), 'zulip-tools-'));
@@ -94,6 +95,127 @@ test('find_user and list_emojis report a Zulip API error as an error, never as a
   try {
     await assert.rejects(tools.handleToolCall('find_user', { query: 'ann' }), /Zulip refused listing users: Invalid API key/);
     await assert.rejects(tools.handleToolCall('list_emojis', {}), /Zulip refused listing realm emoji: Invalid API key/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── Outbound attachments ──
+
+function fakeUploader() {
+  const uploaded: { name: string; bytes: string; mimeType?: string }[] = [];
+  const uploader = {
+    async upload(i: { name: string; data: Buffer; mimeType?: string }) {
+      uploaded.push({ name: i.name, bytes: i.data.toString(), mimeType: i.mimeType });
+      return { name: i.name, path: `/user_uploads/1/ab/${i.name}`, url: `https://z.example.com/user_uploads/1/ab/${i.name}` };
+    },
+  };
+  return { uploader, uploaded };
+}
+
+function runtimeWithUploads(client: Record<string, unknown>, uploader: { upload: (i: any) => Promise<any> }, roots = new Map<string, string>()) {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-tools-'));
+  const session: ZulipSession = { client, selfUserId: 790, realm: 'https://z.example.com', authHeader: 'Basic x', sessionId: 't' };
+  const uploadPolicy: UploadPolicy = { roots, maxBytes: 1024, maxTotalBytes: 4096, maxCount: 10 };
+  const original = console.error;
+  console.error = () => {};
+  try {
+    return { tools: new ZulipToolRuntime(session, dir, { uploader, uploadPolicy }), dir };
+  } finally {
+    console.error = original;
+  }
+}
+
+test('send_message uploads attachments first and links them after the text; content may be empty with files', async () => {
+  const sends: Record<string, unknown>[] = [];
+  const client = { messages: { async send(p: Record<string, unknown>) { sends.push(p); return { result: 'success', id: 500 + sends.length }; } } };
+  const { uploader, uploaded } = fakeUploader();
+  const { tools, dir } = runtimeWithUploads(client, uploader);
+  const sent: unknown[] = [];
+  tools.onSent = (s) => sent.push(s);
+  try {
+    const res = await tools.handleToolCall('send_message', {
+      type: 'stream', to: 'general', topic: 'reports', content: 'weekly numbers',
+      attachments: [{ data: Buffer.from('a,b\n1,2').toString('base64'), name: 'numbers.csv', mime_type: 'text/csv' }],
+    });
+    assert.deepEqual(uploaded, [{ name: 'numbers.csv', bytes: 'a,b\n1,2', mimeType: 'text/csv' }]);
+    assert.equal(sends[0].content, 'weekly numbers\n\n[numbers.csv](/user_uploads/1/ab/numbers.csv)');
+    assert.equal(res.id, 501);
+    assert.deepEqual(res.attachments, [{ name: 'numbers.csv', path: '/user_uploads/1/ab/numbers.csv', url: 'https://z.example.com/user_uploads/1/ab/numbers.csv' }]);
+    assert.equal((sent[0] as { content: string }).content, sends[0].content, 'rollback sees the body as sent');
+
+    const onlyFile = await tools.handleToolCall('send_message', { type: 'stream', to: 'general', topic: 'reports', attachments: [{ data: 'aGk=', name: 'hi.txt' }] });
+    assert.equal(sends[1].content, '[hi.txt](/user_uploads/1/ab/hi.txt)');
+    assert.equal(onlyFile.id, 502);
+
+    await assert.rejects(tools.handleToolCall('send_message', { type: 'stream', to: 'general', topic: 'x' }), /content is required \(or at least one attachment\)/);
+    await assert.rejects(tools.handleToolCall('send_message', { type: 'stream', to: 'general', topic: 'x', content: 'x', attachments: [{ data: 'aGk=' }] }), /need a `name`/);
+    assert.equal(sends.length, 2, 'a bad attachment sends nothing');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('send_dm resolves recipients, then uploads, then sends with the links; upload_file returns the markdown', async () => {
+  const sends: Record<string, unknown>[] = [];
+  const client = {
+    messages: { async send(p: Record<string, unknown>) { sends.push(p); return { result: 'success', id: 9 }; } },
+    users: { async retrieve() { return { result: 'success', members: [{ user_id: 42, full_name: 'Bo', email: 'bo@example.com', is_active: true, is_bot: false }] }; } },
+  };
+  const { uploader, uploaded } = fakeUploader();
+  const { tools, dir } = runtimeWithUploads(client, uploader);
+  try {
+    const res = await tools.handleToolCall('send_dm', { to: ['42'], content: 'here', attachments: [{ data: 'aGk=', name: 'hi.txt' }] });
+    assert.deepEqual(sends[0], { type: 'private', to: [42], content: 'here\n\n[hi.txt](/user_uploads/1/ab/hi.txt)' });
+    assert.deepEqual(res.to_user_ids, [42]);
+    assert.equal(res.attachments[0].path, '/user_uploads/1/ab/hi.txt');
+
+    const up = await tools.handleToolCall('upload_file', { data: Buffer.from('%PDF').toString('base64'), name: 'doc.pdf', mime_type: 'application/pdf' });
+    assert.deepEqual(up, { name: 'doc.pdf', path: '/user_uploads/1/ab/doc.pdf', url: 'https://z.example.com/user_uploads/1/ab/doc.pdf', size: 4, markdown: '[doc.pdf](/user_uploads/1/ab/doc.pdf)' });
+    assert.equal(uploaded[1].mimeType, 'application/pdf');
+    await assert.rejects(tools.handleToolCall('upload_file', { data: Buffer.alloc(2048).toString('base64'), name: 'big.bin' }), /over the 1KB upload ceiling/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('upload_file and the send tools read local files only through a configured root', { skip: LOCAL_FILES_SUPPORTED ? false : 'local-file attachments are Linux-only' }, async () => {
+  const sends: Record<string, unknown>[] = [];
+  const client = { messages: { async send(p: Record<string, unknown>) { sends.push(p); return { result: 'success', id: 3 }; } } };
+  const { uploader, uploaded } = fakeUploader();
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'zulip-root-')));
+  writeFileSync(join(root, 'chart.png'), 'PNG');
+  const { tools, dir } = runtimeWithUploads(client, uploader, new Map([['out', root]]));
+  try {
+    const up = await tools.handleToolCall('upload_file', { file: 'out/chart.png' });
+    assert.equal(up.markdown, '[chart.png](/user_uploads/1/ab/chart.png)');
+    assert.deepEqual(uploaded[0], { name: 'chart.png', bytes: 'PNG', mimeType: 'image/png' });
+    await assert.rejects(tools.handleToolCall('upload_file', { file: join(root, 'chart.png') }), /paths are root-relative/);
+    await assert.rejects(tools.handleToolCall('upload_file', { file: 'out/../chart.png' }), /outside upload root/);
+    await assert.rejects(tools.handleToolCall('send_message', { type: 'stream', to: 'g', topic: 't', attachments: [{ file: 'home/.zuliprc' }] }), /unknown upload root "home"/);
+    assert.equal(sends.length, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('without a realm there is no uploader: attachments error clearly and plain sends still work', async () => {
+  const sends: Record<string, unknown>[] = [];
+  const client = { messages: { async send(p: Record<string, unknown>) { sends.push(p); return { result: 'success', id: 1 }; } } };
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-tools-'));
+  const session: ZulipSession = { client, selfUserId: 790, realm: '', authHeader: '', sessionId: 't' };
+  const original = console.error;
+  console.error = () => {};
+  const tools = new ZulipToolRuntime(session, dir);
+  console.error = original;
+  try {
+    await assert.rejects(tools.handleToolCall('send_message', { type: 'stream', to: 'g', topic: 't', attachments: [{ data: 'aGk=', name: 'a' }] }), /need the realm URL and bot credentials/);
+    await assert.rejects(tools.handleToolCall('send_message', { type: 'stream', to: 'g', topic: 't', attachments: [{ file: 'x/y' }] }), /need the realm URL/, 'the uploader is checked before any file is touched');
+    await assert.rejects(tools.handleToolCall('upload_file', { file: 'x/y' }), /need the realm URL/);
+    await tools.handleToolCall('send_message', { type: 'stream', to: 'g', topic: 't', content: 'ok' });
+    await tools.handleToolCall('send_message', { type: 'stream', to: 'g', topic: 't', content: 'ok', attachments: [] });
+    assert.equal(sends.length, 2, 'an empty attachments array needs no uploader');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
