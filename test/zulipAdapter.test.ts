@@ -9,6 +9,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { ZulipAdapter, type FilterView } from '../src/platforms/zulip.ts';
+import type { MessageChangeEvent } from '../src/platforms/adapter.ts';
 import type { ZulipRawMessage } from '../src/history.ts';
 
 const SELF = 790;
@@ -145,4 +146,73 @@ test('publish uploads image blocks and links them after the text; without an upl
   await plain.publish('zulip:general', undefined, blocks);
   assert.equal(sends[2].content, 'chart attached');
   assert.equal((await plain.publish('zulip:general', undefined, [blocks[1]])).delivered, false);
+});
+
+test('edits, moves and deletions are placed, cleaned and filtered before reaching the server (#22)', async () => {
+  const events = [
+    // Ann's message arrives live (cached), then she edits it to mention the bot.
+    { id: 1, type: 'message', flags: [], message: { ...raw(5), content: 'first draft' } },
+    { id: 2, type: 'update_message', message_id: 5, message_ids: [5], user_id: 7, edit_timestamp: 1_700_000_900, orig_content: 'first draft', content: 'second draft @**Bot**', flags: ['mentioned'], stream_id: 7 },
+    // The bot's own edit is its own doing.
+    { id: 3, type: 'update_message', message_id: 5, message_ids: [5], user_id: SELF, edit_timestamp: 1_700_000_901, orig_content: 'x', content: 'y', flags: [], stream_id: 7 },
+    // A message the cache never saw: one GET places it.
+    { id: 4, type: 'update_message', message_id: 6, message_ids: [6], user_id: 7, edit_timestamp: 1_700_000_902, orig_content: 'm6', content: 'm6 fixed', flags: [], stream_id: 7 },
+    // A moderator moves Ann's message to another topic.
+    { id: 5, type: 'update_message', message_id: 5, message_ids: [5], user_id: 12, edit_timestamp: 1_700_000_903, orig_subject: 'deploys', subject: 'deploys-2', propagate_mode: 'change_one', stream_id: 7 },
+    // The (now edited, moved) message is deleted: placed from the cache.
+    { id: 6, type: 'delete_message', message_ids: [5], message_type: 'stream', stream_id: 7, topic: 'deploys-2' },
+    // A deletion the cache never saw: placed by the stream the event names.
+    { id: 7, type: 'delete_message', message_ids: [900, 901], message_type: 'stream', stream_id: 7, topic: 'old' },
+    // A deleted DM the cache never saw cannot be placed.
+    { id: 8, type: 'delete_message', message_id: 902, message_type: 'private' },
+    // A stream outside the allowlist: nothing.
+    { id: 9, type: 'delete_message', message_ids: [903], message_type: 'stream', stream_id: 8, topic: 't' },
+  ];
+  let polls = 0;
+  const getById: number[] = [];
+  const client = {
+    streams: { retrieve: async () => ({ result: 'success', streams: [{ name: 'general', stream_id: 7, subscriber_count: 2 }, { name: 'secret', stream_id: 8, subscriber_count: 1 }] }) },
+    messages: {
+      retrieve: async () => ({ result: 'success', messages: [], found_newest: true, found_oldest: true }),
+      getById: async ({ message_id }: { message_id: number }) => { getById.push(message_id); return { result: 'success', message: raw(message_id) }; },
+    },
+    queues: { register: async () => ({ queue_id: 'q1', last_event_id: -1 }) },
+    events: {
+      retrieve: async () => {
+        polls++;
+        if (polls === 1) return { events };
+        await new Promise((r) => setTimeout(r, 5));
+        return { events: [] };
+      },
+    },
+  };
+  const filters: FilterView = { streamAllowed: (s) => s === 'general', dmAllowed: () => true };
+  const adapter = new ZulipAdapter(client, SELF, 's', { filters, dmDiscoveryLimit: 0 });
+  await adapter.discoverChannels();
+  const delivered: string[] = [];
+  const changes: MessageChangeEvent[] = [];
+  const original = console.error;
+  console.error = () => {};
+  try {
+    adapter.startEvents((m) => { delivered.push(m.messageId); }, undefined, undefined, (c) => { changes.push(c); });
+    const deadline = Date.now() + 2000;
+    while (changes.length < 5 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+    adapter.stopEvents();
+  } finally {
+    console.error = original;
+  }
+  assert.deepEqual(delivered, ['5'], 'the live message still reaches onMessage');
+  assert.deepEqual(getById, [6], 'only the uncached message cost a GET');
+  const view = changes.map((c) => ({
+    kind: c.kind, channelId: c.channelId, messageId: c.messageId, messageIds: c.messageIds, authorName: c.authorName, actorId: c.actorId,
+    topic: c.topic, previousTopic: c.previousTopic, content: c.content, previousContent: c.previousContent, mentioned: c.mentioned, onOwnMessage: c.onOwnMessage,
+  }));
+  assert.deepEqual(view, [
+    { kind: 'edit', channelId: 'zulip:general', messageId: '5', messageIds: ['5'], authorName: 'Ann', actorId: '7', topic: 'deploys', previousTopic: null, content: 'second draft @**Bot**', previousContent: 'first draft', mentioned: true, onOwnMessage: false },
+    { kind: 'edit', channelId: 'zulip:general', messageId: '6', messageIds: ['6'], authorName: 'Ann', actorId: '7', topic: 'deploys', previousTopic: null, content: 'm6 fixed', previousContent: 'm6', mentioned: false, onOwnMessage: false },
+    { kind: 'move', channelId: 'zulip:general', messageId: '5', messageIds: ['5'], authorName: 'Ann', actorId: '12', topic: 'deploys-2', previousTopic: 'deploys', content: null, previousContent: 'second draft @**Bot**', mentioned: false, onOwnMessage: false },
+    { kind: 'delete', channelId: 'zulip:general', messageId: '5', messageIds: ['5'], authorName: 'Ann', actorId: null, topic: 'deploys-2', previousTopic: null, content: null, previousContent: 'second draft @**Bot**', mentioned: false, onOwnMessage: false },
+    { kind: 'delete', channelId: 'zulip:general', messageId: '900', messageIds: ['900', '901'], authorName: null, actorId: null, topic: 'old', previousTopic: null, content: null, previousContent: null, mentioned: false, onOwnMessage: false },
+  ]);
+  assert.deepEqual(changes[0].timestamp, new Date(1_700_000_900_000), 'an edit is stamped with Zulip\'s edit time');
 });

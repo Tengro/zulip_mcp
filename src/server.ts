@@ -62,7 +62,8 @@ import type { AttachmentRef } from './content.js';
 import { agentLineTimeFormatter } from './timezone.js';
 import { CapabilityGrant } from './grant.js';
 import { StateTracker } from './state.js';
-import type { PlatformAdapter, PlatformSystemEvent, ReactionEvent } from './platforms/adapter.js';
+import type { MessageChangeEvent, PlatformAdapter, PlatformSystemEvent, ReactionEvent } from './platforms/adapter.js';
+import { messageLineHead } from './message-line.js';
 import { CHAT_TAGS } from '@animalabs/mcpl-core';
 import type { ReactionSummary } from './history.js';
 import { toolDefinitions } from './tools.js';
@@ -1512,6 +1513,11 @@ export class ZulipMcplServer {
           console.error('[zulip-mcp] reaction handling failed:', (err as Error).message);
         });
       },
+      (change) => {
+        void this.onMessageChange(change).catch((err) => {
+          console.error('[zulip-mcp] message change handling failed:', (err as Error).message);
+        });
+      },
     );
   }
 
@@ -1557,6 +1563,92 @@ export class ZulipMcplServer {
         reaction: true,
         action: ev.action,
         onOwnMessage: ev.onOwnMessage,
+      });
+    }
+  }
+
+  /**
+   * An edit, move or deletion is as visible as its message was. On an open
+   * channel every message is delivered, so a change to one the host has
+   * accepted (at or below the watermark), one that addresses the bot, or
+   * one the bot wrote is delivered too. On a closed channel only addressed
+   * traffic is pushed, so only an addressed change is — the mention the
+   * agent is about to answer was rewritten, or the DM it is reading changed.
+   * A change to a message the host never accepted is noise: it arrives
+   * already changed if it arrives at all. The synthetic id never advances a
+   * watermark; the line carries the message's own id for fetch_around.
+   */
+  private async onMessageChange(ev: MessageChangeEvent): Promise<void> {
+    if (this.isMuted(ev.channelId) || !this.isAllowed(ev.channelId)) return;
+    if (!this.mcplActive || !this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) return;
+    const addressed = ev.mentioned || ev.isDM;
+    const open = this.channelManager.isOpen(ev.channelId);
+    if (!open && !addressed) return;
+    if (open && !addressed && !ev.onOwnMessage) {
+      const watermark = this.delivery.watermark(ev.channelId);
+      const ids = ev.messageIds.map(Number).filter((n) => Number.isFinite(n));
+      if (watermark === undefined || !ids.some((n) => n <= watermark)) return;
+    }
+
+    const head = messageLineHead({
+      id: ev.messageId,
+      time: Number.isNaN(ev.timestamp.getTime()) ? '' : this.formatTime(ev.timestamp),
+      stream: ev.isDM ? null : (ev.channelId.startsWith('zulip:') ? ev.channelId.slice('zulip:'.length) : ev.channelId),
+      topic: ev.topic,
+      author: ev.authorName ?? 'unknown author',
+      mentioned: ev.mentioned,
+    });
+    const others = ev.messageIds.length > 1 ? ` (${ev.messageIds.length} messages)` : '';
+    const byOther = ev.actorId !== null && ev.actorId !== ev.authorId ? ` [by user ${ev.actorId}]` : '';
+    const wasQuoted = ev.previousContent ? ` — was: "${ev.previousContent}"` : '';
+    const movedTo = ev.movedToChannelId ? ` (now in ${ev.movedToChannelId})` : '';
+    const fromTopic = ev.previousTopic !== null ? ` [moved from topic "${ev.previousTopic}"${movedTo}]` : (movedTo ? ` [moved${movedTo}]` : '');
+    let line: string;
+    if (ev.kind === 'edit') {
+      line = `[edited] ${head}${ev.content ?? ''}${fromTopic}${byOther}`;
+    } else if (ev.kind === 'move') {
+      line = `[moved] ${head}topic changed${ev.previousTopic !== null ? ` from "${ev.previousTopic}"` : ''}${movedTo}${others}${byOther}`;
+    } else {
+      line = `[deleted] ${head}message deleted${others}${wasQuoted}`;
+    }
+    const tag = ev.kind === 'delete' ? CHAT_TAGS.deleted : CHAT_TAGS.edited;
+    const stamp = ev.timestamp.getTime();
+    const message: IncomingChannelMessage = {
+      channelId: ev.channelId,
+      messageId: `${ev.kind}:${ev.messageId}:${stamp}`,
+      threadId: ev.topic || undefined,
+      author: { id: ev.authorId ?? 'unknown', name: ev.authorName ?? 'unknown author' },
+      timestamp: ev.timestamp.toISOString(),
+      content: [{ type: 'text', text: line }],
+      tags: [
+        tag,
+        ...(ev.kind === 'move' ? ['zulip:moved'] : []),
+        ...(ev.mentioned ? [CHAT_TAGS.mention] : []),
+        ...(ev.isDM ? [CHAT_TAGS.dm] : []),
+      ],
+      metadata: {
+        change: ev.kind,
+        targetMessageId: ev.messageId,
+        targetMessageIds: ev.messageIds,
+        ...(ev.actorId !== null ? { actorId: ev.actorId } : {}),
+        topic: ev.topic,
+        ...(ev.previousTopic !== null ? { previousTopic: ev.previousTopic } : {}),
+        ...(ev.movedToChannelId !== null ? { movedToChannelId: ev.movedToChannelId } : {}),
+        ...(ev.previousContent !== null ? { previousContent: ev.previousContent } : {}),
+        mentioned: ev.mentioned,
+        isDM: ev.isDM,
+        onOwnMessage: ev.onOwnMessage,
+        // The line already names who, where and when.
+        attributed: true,
+        attributionHeader: `[${ev.kind === 'delete' ? 'deleted' : ev.kind === 'move' ? 'moved' : 'edited'}] ${head}`,
+      },
+    };
+    if (open) {
+      this.channelManager.onIncomingMessage(ev.channelId, message);
+    } else {
+      await this.pushEvent(message, `zulip_${ev.kind}_${ev.messageId}_${stamp}`, {
+        change: ev.kind,
+        targetMessageId: ev.messageId,
       });
     }
   }

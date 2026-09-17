@@ -231,3 +231,16 @@ test('reactions are bucketed by emoji and rendered with counts and self-marking'
   assert.deepEqual((toIncoming('zulip:general', m, { selfUserId: 790, sessionId: 's' }).metadata as { reactions: unknown }).reactions, m.reactions);
   assert.equal((toIncoming('zulip:general', normalizeMessage(raw()), { selfUserId: 790, sessionId: 's' }).metadata as { reactions?: unknown }).reactions, undefined);
 });
+
+test('an edited message carries editedAt and reads "(edited)" wherever history is rendered (#22)', () => {
+  const never = normalizeMessage(raw());
+  assert.equal(never.editedAt, null);
+  const edited = normalizeMessage(raw({ last_edit_timestamp: 1_700_000_500 }));
+  assert.deepEqual(edited.editedAt, new Date(1_700_000_500_000));
+  const incoming = toIncoming('zulip:general', edited, { selfUserId: 790, sessionId: 's' });
+  assert.match((incoming.content[0] as { text: string }).text, / \(edited\)$/);
+  assert.equal((incoming.metadata as { editedAt: string }).editedAt, '2023-11-14T22:21:40.000Z');
+  const plain = toIncoming('zulip:general', never, { selfUserId: 790, sessionId: 's' });
+  assert.doesNotMatch((plain.content[0] as { text: string }).text, /\(edited\)/);
+  assert.equal('editedAt' in (plain.metadata as object), false);
+});

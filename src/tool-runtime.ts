@@ -18,7 +18,7 @@ import {
   toFetchResult,
 } from "./content.js";
 import type { ZulipSession } from "./zulip-client.js";
-import { assertApiSuccess, dmChannelIdFor, fetchAround, fetchHistory, parseDmChannelId, renderReactions, type ReactionSummary, type ZulipMessage } from "./history.js";
+import { assertApiSuccess, dmChannelIdFor, fetchAround, fetchHistory, parseDmChannelId, renderReactions, type ReactionSummary, type ZulipMessage, editedTrailer } from './history.js';
 import { chunkMessage } from "./content.js";
 import { messageLineHead } from "./message-line.js";
 import { agentLineTimeFormatter } from "./timezone.js";
@@ -197,7 +197,7 @@ export function formatHistoryLines(
     const mark = m.id === anchorId ? " <<" : "";
     const att = m.attachments.length > 0 ? ` [attachments: ${m.attachments.map((a) => a.path).join(", ")}]` : "";
     const reactions = renderReactions(projectReactions(m.reactions, policy), selfUserId);
-    return `${head}${m.cleanContent}${att}${reactions}${mark}`;
+    return `${head}${m.cleanContent}${editedTrailer(m)}${att}${reactions}${mark}`;
   }).join("\n");
 }
 
