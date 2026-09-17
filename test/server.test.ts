@@ -1593,9 +1593,9 @@ test('an edit, move or deletion is as visible as its message: open channels see 
   assert.equal(h.server.delivery.watermark('zulip:general'), 10);
 
   const change = (over: Partial<MessageChangeEvent> = {}): MessageChangeEvent => ({
-    kind: 'edit', channelId: 'zulip:general', messageId: '10', messageIds: ['10'], authorId: '9', authorName: 'Ann', actorId: '9',
+    kind: 'edit', channelId: 'zulip:general', messageId: '10', messageIds: ['10'], authorId: '9', authorName: 'Ann', authorEmail: 'ann@example.com', actorId: '9',
     topic: 'deploys', previousTopic: null, movedToChannelId: null, content: 'ship it tomorrow', previousContent: 'ship it',
-    mentioned: false, isDM: false, onOwnMessage: false, timestamp: new Date(1_700_000_060_000),
+    mentioned: false, previouslyMentioned: false, isDM: false, onOwnMessage: false, timestamp: new Date(1_700_000_060_000),
     ...over,
   });
 
@@ -1605,11 +1605,13 @@ test('an edit, move or deletion is as visible as its message: open channels see 
   await until(() => h.incoming.length === 2, 'edit on the open channel');
   const edited = h.incoming[1];
   assert.equal((edited.content[0] as { text: string }).text, '[edited] [T id=10] [#general > deploys] Ann: ship it tomorrow');
-  assert.deepEqual(edited.tags, ['chat:edited']);
-  assert.equal(edited.messageId, 'edit:10:1700000060000');
+  assert.deepEqual(edited.tags, ['chat:edited', 'chat:ambient'], 'an ambient change is tagged ambient, so a debounced policy treats it as such');
+  assert.match(edited.messageId, /^edit:10:1700000060000\.\d+$/);
+  assert.equal(edited.threadId, undefined, 'a marker about a message is not the conversation');
   const meta = edited.metadata as Record<string, unknown>;
   assert.equal(meta.targetMessageId, '10');
   assert.equal(meta.previousContent, 'ship it');
+  assert.equal(meta.senderEmail, 'ann@example.com');
   assert.equal(meta.attributed, true);
   assert.equal(h.server.delivery.watermark('zulip:general'), 10, 'a change never advances the watermark');
 
@@ -1626,13 +1628,29 @@ test('an edit, move or deletion is as visible as its message: open channels see 
   h.adapter.change!(change({ kind: 'delete', messageId: '12', messageIds: ['12'], content: null, previousContent: 'my own line', onOwnMessage: true, actorId: null }));
   await until(() => h.incoming.length === 4, 'a deletion of the bot\'s own message');
   assert.equal((h.incoming[3].content[0] as { text: string }).text, '[deleted] [T id=12] [#general > deploys] Ann: message deleted — was: "my own line"');
-  assert.deepEqual(h.incoming[3].tags, ['chat:deleted']);
+  assert.deepEqual(h.incoming[3].tags, ['chat:deleted', 'chat:ambient']);
 
-  // A moderator's topic move of three messages reads as one line.
-  h.adapter.change!(change({ kind: 'move', messageIds: ['10', '8', '9'], content: null, previousTopic: 'deploys', topic: 'deploys-2', actorId: '12' }));
-  await until(() => h.incoming.length === 5, 'a topic move');
-  assert.equal((h.incoming[4].content[0] as { text: string }).text, '[moved] [T id=10] [#general > deploys-2] Ann: topic changed from "deploys" (3 messages) [by user 12]');
-  assert.deepEqual(h.incoming[4].tags, ['chat:edited', 'zulip:moved']);
+  // A message offered but not yet accepted (held) counts as seen: "post,
+  // then fix the typo" lands before the host's acceptance round trip.
+  h.policy.rejectIds.add('13');
+  h.adapter.emit!({
+    channelId: 'zulip:general', messageId: '13', author: { id: '9', name: 'Ann' }, timestamp: new Date(1_700_000_070_000).toISOString(),
+    content: [{ type: 'text', text: 'shp it' }], tags: ['chat:ambient'], metadata: { topic: 'deploys', mentioned: false, isDM: false },
+  });
+  await until(() => h.server.delivery.heldIds('zulip:general').includes(13), 'the refused message is held');
+  h.adapter.change!(change({ messageId: '13', messageIds: ['13'], content: 'ship it', previousContent: 'shp it' }));
+  await until(() => h.incoming.length === 5, 'an edit of a held message');
+  assert.equal((h.incoming[4].content[0] as { text: string }).text, '[edited] [T id=13] [#general > deploys] Ann: ship it');
+
+  // A moderator's topic move of three messages reads as one line and does
+  // not retarget the agent's reply: the conversation is still in `deploys`.
+  h.adapter.change!(change({ kind: 'move', messageIds: ['10', '8', '9'], content: null, previousContent: null, previousTopic: 'deploys', topic: 'deploys-2', actorId: '12' }));
+  await until(() => h.incoming.length === 6, 'a topic move');
+  assert.equal((h.incoming[5].content[0] as { text: string }).text, '[moved] [T id=10] [#general > deploys-2] Ann: topic changed from "deploys" (3 messages) [by user 12]');
+  assert.deepEqual(h.incoming[5].tags, ['chat:edited', 'zulip:moved', 'chat:ambient']);
+  await h.host.sendRequest(method.CHANNELS_PUBLISH, { conversationId: 'c', channelId: 'zulip:general', content: [{ type: 'text', text: 'on it' }] });
+  assert.equal(h.adapter.published.length, 1);
+  assert.equal((h.adapter.published[0].hints?.metadata as { topic: string }).topic, 'deploys', 'a move marker must not hijack reply routing');
 
   // Closed channel: an ambient edit is dropped, an addressed one is pushed.
   await h.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
@@ -1642,9 +1660,18 @@ test('an edit, move or deletion is as visible as its message: open channels see 
   h.adapter.change!(change({ mentioned: true, content: 'ship it @Bot' }));
   await until(() => h.pushed.length === 1, 'an addressed edit on a closed channel');
   assert.deepEqual(h.pushed[0].tags, ['chat:edited', 'chat:mention']);
-  assert.equal(h.pushed[0].eventId, 'zulip_edit_10_1700000060000');
+  assert.match(h.pushed[0].eventId, /^zulip_edit_10_1700000060000\.\d+$/);
   assert.equal((h.pushed[0].origin as { change: string; isMention: boolean }).change, 'edit');
   assert.equal((h.pushed[0].origin as { change: string; isMention: boolean }).isMention, true);
+  // Two edits within the same second are two pushes, not a host-side duplicate.
+  h.adapter.change!(change({ mentioned: true, content: 'ship it @Bot now' }));
+  await until(() => h.pushed.length === 2, 'a second edit within the same second');
+  assert.notEqual(h.pushed[1].eventId, h.pushed[0].eventId);
+  // A deleted mention on a closed channel is pushed: the message the agent
+  // was about to answer is gone.
+  h.adapter.change!(change({ kind: 'delete', content: null, mentioned: true, previouslyMentioned: true, actorId: null }));
+  await until(() => h.pushed.length === 3, 'a deleted mention on a closed channel');
+  assert.deepEqual(h.pushed[2].tags, ['chat:deleted', 'chat:mention']);
 
   await h.close();
 });

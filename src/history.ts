@@ -30,8 +30,11 @@ export interface ZulipRawMessage {
   /** The requesting user's flags — `mentioned` is Zulip's server-side verdict. */
   flags?: string[];
   reactions?: { emoji_name: string; emoji_code?: string; reaction_type?: string; user_id: number }[];
-  /** Unix seconds of the last content or topic edit; absent when never edited. */
+  /** Unix seconds of the last content edit (content only since Zulip 10);
+   *  absent when never edited. */
   last_edit_timestamp?: number;
+  /** Unix seconds of the last topic or stream move (Zulip 10+); absent when never moved. */
+  last_moved_timestamp?: number;
 }
 
 /** One emoji reaction bucket on a message. */
@@ -101,8 +104,10 @@ export interface ZulipMessage {
   attachments: AttachmentRef[];
   /** Reactions currently on the message (history fetches carry them; events do not). */
   reactions: ReactionSummary[];
-  /** When the message was last edited; null when never (history fetches carry it; events do not). */
+  /** When the content was last edited; null when never (history fetches carry it; events do not). */
   editedAt: Date | null;
+  /** When the message was last moved to another topic or stream; null when never. */
+  movedAt: Date | null;
 }
 
 export interface HistoryQuery {
@@ -226,12 +231,13 @@ export function normalizeMessage(raw: ZulipRawMessage): ZulipMessage {
     attachments: extractZulipAttachments(raw.content),
     reactions: summarizeReactions(raw.reactions),
     editedAt: typeof raw.last_edit_timestamp === 'number' ? new Date(raw.last_edit_timestamp * 1000) : null,
+    movedAt: typeof raw.last_moved_timestamp === 'number' ? new Date(raw.last_moved_timestamp * 1000) : null,
   };
 }
 
-/** ` (edited)` for a message edited since it was sent, else ''. */
-export function editedTrailer(m: Pick<ZulipMessage, 'editedAt'>): string {
-  return m.editedAt ? ' (edited)' : '';
+/** ` (edited)` / ` (moved)` / both for a message changed since it was sent, else ''. */
+export function editedTrailer(m: Pick<ZulipMessage, 'editedAt' | 'movedAt'>): string {
+  return `${m.editedAt ? ' (edited)' : ''}${m.movedAt ? ' (moved)' : ''}`;
 }
 
 /**
@@ -377,6 +383,7 @@ export function toIncoming(
       ...(m.attachments.length > 0 ? { attachments: m.attachments } : {}),
       ...(m.reactions.length > 0 ? { reactions: m.reactions } : {}),
       ...(m.editedAt ? { editedAt: m.editedAt.toISOString() } : {}),
+      ...(m.movedAt ? { movedAt: m.movedAt.toISOString() } : {}),
       ...extra,
     },
   };

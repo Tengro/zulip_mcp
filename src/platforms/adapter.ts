@@ -110,7 +110,9 @@ export interface MessageChangeEvent {
    *  adapter's cache is placed by stream alone). */
   authorId: string | null;
   authorName: string | null;
-  /** Who made the change; null for a server-side change or when unknown. */
+  authorEmail: string | null;
+  /** Who made the change; null for a server-side change or when unknown
+   *  (Zulip's delete event names no actor). */
   actorId: string | null;
   /** The topic after the change; '' for a direct message. */
   topic: string;
@@ -125,6 +127,9 @@ export interface MessageChangeEvent {
   previousContent: string | null;
   /** The bot is mentioned in the message as it now reads (Zulip's verdict). */
   mentioned: boolean;
+  /** The bot was mentioned in the message as it read before the change, as
+   *  far as the adapter knows (a deleted message keeps its last verdict). */
+  previouslyMentioned: boolean;
   isDM: boolean;
   /** The changed message was authored by the bot. */
   onOwnMessage: boolean;
@@ -215,6 +220,10 @@ export interface PlatformAdapter {
 
   /** Delete one of the bot's own messages (rollback). */
   deleteMessage?(channelId: string, messageId: string): Promise<void>;
+
+  /** A message the bot deleted through another path (a tool) — its delete
+   *  event is the bot's own doing and must not surface as a change. */
+  noteSelfDeleted?(messageId: number): void;
 
   /**
    * Start delivering real-time messages. Adapters filter the bot's own

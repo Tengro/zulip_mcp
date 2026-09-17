@@ -243,4 +243,13 @@ test('an edited message carries editedAt and reads "(edited)" wherever history i
   const plain = toIncoming('zulip:general', never, { selfUserId: 790, sessionId: 's' });
   assert.doesNotMatch((plain.content[0] as { text: string }).text, /\(edited\)/);
   assert.equal('editedAt' in (plain.metadata as object), false);
+  // Since Zulip 10 last_edit_timestamp is content-only; a move has its own stamp.
+  const moved = normalizeMessage(raw({ last_moved_timestamp: 1_700_000_600 }));
+  assert.equal(moved.editedAt, null);
+  assert.deepEqual(moved.movedAt, new Date(1_700_000_600_000));
+  const movedLine = toIncoming('zulip:general', moved, { selfUserId: 790, sessionId: 's' });
+  assert.match((movedLine.content[0] as { text: string }).text, / \(moved\)$/);
+  assert.equal((movedLine.metadata as { movedAt: string }).movedAt, '2023-11-14T22:23:20.000Z');
+  const both = normalizeMessage(raw({ last_edit_timestamp: 1_700_000_500, last_moved_timestamp: 1_700_000_600 }));
+  assert.match((toIncoming('zulip:general', both, { selfUserId: 790, sessionId: 's' }).content[0] as { text: string }).text, / \(edited\) \(moved\)$/);
 });

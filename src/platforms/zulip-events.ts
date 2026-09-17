@@ -79,7 +79,9 @@ export interface ZulipUpdateMessageEvent {
   message_id: number;
   /** Every message the change touched — many for a topic move with `propagate_mode`. */
   message_ids?: number[];
-  /** Who made the change; null for a server-side change. */
+  /** Who made the change — the acting user, despite the published docs
+   *  calling it "the user who sent the message" (zerver/actions/
+   *  message_edit.py sets it from the editor); null for a server-side change. */
   user_id?: number | null;
   edit_timestamp?: number;
   rendering_only?: boolean;
@@ -116,8 +118,10 @@ export type ZulipMessageChange =
       /** New raw content; null when only the topic or stream changed. */
       content: string | null;
       origContent: string | null;
-      /** New topic; null when unchanged. */
+          /** New topic; null when the topic name did not change (Zulip omits
+       *  `subject` for a stream-only move but still sends `orig_subject`). */
       topic: string | null;
+      /** The topic before any move (topic or stream); null for a content edit. */
       origTopic: string | null;
       streamId: number | null;
       /** Set when the message moved to another stream. */
@@ -266,10 +270,15 @@ export class ZulipEventLoop {
     // Zulip delivers exactly the registered types: without 'update_message'
     // and 'delete_message' an edit to a message the agent was mentioned in
     // never arrived at all (#22).
+    // `client_capabilities` must be pre-stringified: zulip-js JSON-encodes
+    // arrays only, and a raw object goes over the wire as "[object Object]".
+    // Without bulk_message_deletion a topic deletion is one event per
+    // message.
     const registration = await zulipClient.queues.register({
       event_types: ['message', 'reaction', 'update_message', 'delete_message'],
       all_public_streams: 'true',
       apply_markdown: 'false',
+      client_capabilities: JSON.stringify({ bulk_message_deletion: true }),
     });
 
     this.queueId = registration.queue_id;
@@ -368,7 +377,9 @@ export class ZulipEventLoop {
             // A re-render is not an edit: nothing the author wrote changed.
             if (onChange && typeof event.message_id === 'number' && event.rendering_only !== true) {
               const contentChanged = typeof event.orig_content === 'string';
-              const topicChanged = typeof event.orig_subject === 'string';
+              // `orig_subject` accompanies every move; `subject` only a topic rename.
+              const moved = typeof event.orig_subject === 'string';
+              const topicChanged = moved && typeof event.subject === 'string' && event.subject !== event.orig_subject;
               const streamChanged = typeof event.new_stream_id === 'number';
               if (contentChanged || topicChanged || streamChanged) {
                 try {
@@ -382,8 +393,8 @@ export class ZulipEventLoop {
                     editedAt: typeof event.edit_timestamp === 'number' ? event.edit_timestamp : Math.floor(Date.now() / 1000),
                     content: contentChanged && typeof event.content === 'string' ? event.content : null,
                     origContent: contentChanged ? String(event.orig_content) : null,
-                    topic: topicChanged && typeof event.subject === 'string' ? event.subject : null,
-                    origTopic: topicChanged ? String(event.orig_subject) : null,
+                    topic: topicChanged ? String(event.subject) : null,
+                    origTopic: moved ? String(event.orig_subject) : null,
                     streamId: typeof event.stream_id === 'number' ? event.stream_id : null,
                     newStreamId: streamChanged ? Number(event.new_stream_id) : null,
                     flags: Array.isArray(event.flags) ? event.flags : [],

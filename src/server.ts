@@ -146,6 +146,8 @@ export class ZulipMcplServer {
   private readonly catchupLimit: number;
   private readonly missedBlockMaxChars: number;
   private readonly formatTime: (d: Date) => string;
+  /** Distinguishes change markers minted within the same second. */
+  private changeSeq = 0;
   private readonly attributeDelivery: boolean;
   private readonly filters: FiltersPlane | null;
 
@@ -210,6 +212,9 @@ export class ZulipMcplServer {
     });
     // Sends made through the tool surface are part of the rollback record.
     this.tools.onSent = (sent) => this.stateTracker.recordSent(sent.messageId, sent.channelId, sent.content);
+    // A deletion made through the tool surface echoes back as a delete event
+    // without an actor; the adapter recognises its own.
+    this.tools.onDeleted = (messageId) => this.adapter.noteSelfDeleted?.(Number(messageId));
   }
 
   /** True when the connected peer negotiated MCPL. */
@@ -1585,9 +1590,13 @@ export class ZulipMcplServer {
     const open = this.channelManager.isOpen(ev.channelId);
     if (!open && !addressed) return;
     if (open && !addressed && !ev.onOwnMessage) {
-      const watermark = this.delivery.watermark(ev.channelId);
+      // Accepted (at or below the watermark) or offered and not yet accepted
+      // (held): "post, then fix the typo" lands before the host's acceptance
+      // round trip and must not be lost.
+      const watermark = this.delivery.watermark(ev.channelId) ?? 0;
+      const held = new Set(this.delivery.heldIds(ev.channelId));
       const ids = ev.messageIds.map(Number).filter((n) => Number.isFinite(n));
-      if (watermark === undefined || !ids.some((n) => n <= watermark)) return;
+      if (!ids.some((n) => n <= watermark || held.has(n))) return;
     }
 
     const head = messageLineHead({
@@ -1612,30 +1621,38 @@ export class ZulipMcplServer {
       line = `[deleted] ${head}message deleted${others}${wasQuoted}`;
     }
     const tag = ev.kind === 'delete' ? CHAT_TAGS.deleted : CHAT_TAGS.edited;
-    const stamp = ev.timestamp.getTime();
+    // Zulip's edit time has one-second resolution and the host dedupes
+    // pushes by eventId: a counter keeps two edits within a second apart.
+    const stamp = `${ev.timestamp.getTime()}.${++this.changeSeq}`;
     const message: IncomingChannelMessage = {
       channelId: ev.channelId,
       messageId: `${ev.kind}:${ev.messageId}:${stamp}`,
-      threadId: ev.topic || undefined,
+      // No threadId: a marker about a message is not the conversation and
+      // must not retarget the reply the agent is composing (see
+      // ChannelManager.onIncomingMessage).
       author: { id: ev.authorId ?? 'unknown', name: ev.authorName ?? 'unknown author' },
       timestamp: ev.timestamp.toISOString(),
       content: [{ type: 'text', text: line }],
+      // The same addressing tag a message carries, so a debounced or
+      // tag-keyed policy sees an ambient change as ambient; the host folds
+      // chat:mention / chat:dm into chat:addressed.
       tags: [
         tag,
         ...(ev.kind === 'move' ? ['zulip:moved'] : []),
-        ...(ev.mentioned ? [CHAT_TAGS.mention] : []),
-        ...(ev.isDM ? [CHAT_TAGS.dm] : []),
+        ...(ev.isDM ? [CHAT_TAGS.dm, CHAT_TAGS.private] : ev.mentioned ? [CHAT_TAGS.mention] : [CHAT_TAGS.ambient]),
       ],
       metadata: {
         change: ev.kind,
         targetMessageId: ev.messageId,
         targetMessageIds: ev.messageIds,
         ...(ev.actorId !== null ? { actorId: ev.actorId } : {}),
+        ...(ev.authorEmail !== null ? { senderEmail: ev.authorEmail } : {}),
         topic: ev.topic,
         ...(ev.previousTopic !== null ? { previousTopic: ev.previousTopic } : {}),
         ...(ev.movedToChannelId !== null ? { movedToChannelId: ev.movedToChannelId } : {}),
         ...(ev.previousContent !== null ? { previousContent: ev.previousContent } : {}),
         mentioned: ev.mentioned,
+        previouslyMentioned: ev.previouslyMentioned,
         isDM: ev.isDM,
         onOwnMessage: ev.onOwnMessage,
         // The line already names who, where and when.
@@ -1695,7 +1712,7 @@ function numericId(m: IncomingChannelMessage): number | null {
 /** The human sender of a real message; null for synthetic ones (system markers, reactions, catch-up blocks). */
 function senderOf(m: IncomingChannelMessage): { id: number; email: string } | null {
   const meta = (typeof m.metadata === 'object' && m.metadata !== null ? m.metadata : {}) as Record<string, unknown>;
-  if (meta.system === true || meta.reaction === true || meta.missed === true) return null;
+  if (meta.system === true || meta.reaction === true || meta.missed === true || typeof meta.change === 'string') return null;
   const id = Number(m.author?.id);
   if (!Number.isFinite(id)) return null;
   return { id, email: typeof meta.senderEmail === 'string' ? meta.senderEmail : '' };

@@ -154,9 +154,9 @@ them too; add `"tagsNone": ["chat:reaction", "chat:reaction-remove"]` to it.
 ### Edits, moves and deletions
 
 A change to a message is as visible as the message was. An edit, a topic
-move or a deletion of a message the host has accepted on an open channel
-(or of the bot's own message) surfaces on that channel as one line in the
-shared shape, carrying the message's own id so `fetch_around` still works:
+move or a deletion of a message the host has accepted (or been offered) on
+an open channel, or of the bot's own message, surfaces on that channel as
+one line in the shared shape, carrying the message's own id:
 
 ```
 [edited] [10:42 id=77] [#general > deploys] Ann: ship it tomorrow
@@ -165,21 +165,29 @@ shared shape, carrying the message's own id so `fetch_around` still works:
 ```
 
 On a closed channel only an addressed change is pushed — the mention the
-agent is about to answer was rewritten, or a DM it is reading changed — the
-same rule as for messages. A change to a message the host never accepted is
-dropped: it arrives already changed if it arrives at all. Zulip re-renders
-(a link preview arriving) are not edits and never surface; the bot's own
-edits are its own doing and never surface either.
+agent is about to answer was rewritten or deleted, or a DM it is reading
+changed — the same rule as for messages. A change to a message the host was
+never offered is dropped. Zulip re-renders (a link preview arriving) are
+not edits and never surface; the bot's own edits and deletions (rollback,
+`delete_message`) are its own doing and never surface either. A moved
+message is reported on the channel it left, naming where it went.
 
 The lines carry `chat:edited` (moves add `zulip:moved`) or `chat:deleted`,
-plus `chat:mention` / `chat:dm` when the message addresses the bot as it
-now reads, so a tag-keyed wake policy wakes only on an addressing edit. An
-unconditional per-channel policy wakes on every change; add
-`"tagsNone": ["chat:edited", "chat:deleted"]` to it if that is unwanted.
+plus the same addressing tag a message would: `chat:mention` when the
+message mentions the bot as it now reads, `chat:dm` for a DM, else
+`chat:ambient` — so a tag-keyed wake policy wakes on an edit exactly when
+it would wake on the message, and a debounced ambient policy debounces
+ambient edits. An unconditional per-channel policy wakes on every change;
+add `"tagsNone": ["chat:edited", "chat:deleted"]` to it if that is unwanted.
 `metadata` carries `change`, `targetMessageId(s)`, `previousContent`,
-`previousTopic` and `actorId`. Synthetic ids (`edit:77:…`) never advance
-the delivery watermark. History and backscroll render an edited message
-with an `(edited)` trailer and `metadata.editedAt`.
+`previousTopic`, `movedToChannelId`, `actorId`, `mentioned` and
+`previouslyMentioned`. A change line never sets `threadId` and never moves
+reply routing: a moderator archiving an old message does not retarget the
+reply the agent is composing. Synthetic ids (`edit:77:…`) never advance the
+delivery watermark; the message's own id in the line is what `fetch_around`
+takes (a deleted id can no longer be fetched). History and backscroll
+render `(edited)` and `(moved)` trailers with `metadata.editedAt` /
+`movedAt`.
 
 ## Channels
 

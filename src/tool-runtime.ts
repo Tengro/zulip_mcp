@@ -222,6 +222,8 @@ export class ZulipToolRuntime {
   /** Set by the MCPL server: every message sent by a tool is reported here
    *  so a rollback checkpoint can undo it. */
   onSent: ((sent: SentRecord) => void) | null = null;
+  /** Called after delete_message succeeds, before the delete event echoes back. */
+  onDeleted: ((messageId: string) => void) | null = null;
 
   private readonly uploader: Uploader | null;
   private readonly uploadPolicy: UploadPolicy;
@@ -674,6 +676,9 @@ export class ZulipToolRuntime {
       }
 
       case "delete_message": {
+        // Noted before the call: the delete event can arrive before the
+        // response does.
+        this.onDeleted?.(String(args.message_id));
         const result = await zulipClient.messages.deleteById({
           message_id: args.message_id,
         });
