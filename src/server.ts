@@ -215,6 +215,7 @@ export class ZulipMcplServer {
     // A deletion made through the tool surface echoes back as a delete event
     // without an actor; the adapter recognises its own.
     this.tools.onDeleted = (messageId) => this.adapter.noteSelfDeleted?.(Number(messageId));
+    this.tools.onDeleteFailed = (messageId) => this.adapter.forgetSelfDeleted?.(Number(messageId));
   }
 
   /** True when the connected peer negotiated MCPL. */
@@ -1617,6 +1618,8 @@ export class ZulipMcplServer {
       line = `[edited] ${head}${ev.content ?? ''}${fromTopic}${byOther}`;
     } else if (ev.kind === 'move') {
       line = `[moved] ${head}topic changed${ev.previousTopic !== null ? ` from "${ev.previousTopic}"` : ''}${movedTo}${others}${byOther}`;
+    } else if (ev.vanished) {
+      line = `[deleted] ${head}no longer visible to the bot (moved to a stream it cannot see)${others}${wasQuoted}`;
     } else {
       line = `[deleted] ${head}message deleted${others}${wasQuoted}`;
     }
@@ -1652,7 +1655,8 @@ export class ZulipMcplServer {
         ...(ev.movedToChannelId !== null ? { movedToChannelId: ev.movedToChannelId } : {}),
         ...(ev.previousContent !== null ? { previousContent: ev.previousContent } : {}),
         mentioned: ev.mentioned,
-        previouslyMentioned: ev.previouslyMentioned,
+        ...(ev.previouslyMentioned !== null ? { previouslyMentioned: ev.previouslyMentioned } : {}),
+        ...(ev.vanished ? { vanished: true } : {}),
         isDM: ev.isDM,
         onOwnMessage: ev.onOwnMessage,
         // The line already names who, where and when.

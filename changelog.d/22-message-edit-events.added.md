@@ -9,7 +9,8 @@
   and to the bot's own, closed channels are pushed only addressed ones
   (a deleted mention included); re-renders and the bot's own edits and
   deletions never surface; a cross-stream move is reported where the
-  message was seen. Change lines never retarget reply routing (nor do
+  message was seen, and a move into a stream the bot cannot see is
+  reported as "no longer visible" rather than deleted. Change lines never retarget reply routing (nor do
   reaction lines any more). `PlatformAdapter` gains optional
   `onMessageChange` (on `startEvents`) and `noteSelfDeleted`. History and
   backscroll render `(edited)` / `(moved)` trailers with

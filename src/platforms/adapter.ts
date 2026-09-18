@@ -128,8 +128,13 @@ export interface MessageChangeEvent {
   /** The bot is mentioned in the message as it now reads (Zulip's verdict). */
   mentioned: boolean;
   /** The bot was mentioned in the message as it read before the change, as
-   *  far as the adapter knows (a deleted message keeps its last verdict). */
-  previouslyMentioned: boolean;
+   *  far as the adapter knows (a deleted message keeps its last verdict);
+   *  null when the message was not in the adapter's cache and only its
+   *  post-change state could be read. */
+  previouslyMentioned: boolean | null;
+  /** A deletion event for a message that had just moved to a stream the bot
+   *  cannot see: Zulip reports lost visibility as a deletion. */
+  vanished: boolean;
   isDM: boolean;
   /** The changed message was authored by the bot. */
   onOwnMessage: boolean;
@@ -224,6 +229,8 @@ export interface PlatformAdapter {
   /** A message the bot deleted through another path (a tool) — its delete
    *  event is the bot's own doing and must not surface as a change. */
   noteSelfDeleted?(messageId: number): void;
+  /** That deletion failed: the message still exists. */
+  forgetSelfDeleted?(messageId: number): void;
 
   /**
    * Start delivering real-time messages. Adapters filter the bot's own

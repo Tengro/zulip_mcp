@@ -1595,7 +1595,7 @@ test('an edit, move or deletion is as visible as its message: open channels see 
   const change = (over: Partial<MessageChangeEvent> = {}): MessageChangeEvent => ({
     kind: 'edit', channelId: 'zulip:general', messageId: '10', messageIds: ['10'], authorId: '9', authorName: 'Ann', authorEmail: 'ann@example.com', actorId: '9',
     topic: 'deploys', previousTopic: null, movedToChannelId: null, content: 'ship it tomorrow', previousContent: 'ship it',
-    mentioned: false, previouslyMentioned: false, isDM: false, onOwnMessage: false, timestamp: new Date(1_700_000_060_000),
+    mentioned: false, previouslyMentioned: false, vanished: false, isDM: false, onOwnMessage: false, timestamp: new Date(1_700_000_060_000),
     ...over,
   });
 
@@ -1672,6 +1672,11 @@ test('an edit, move or deletion is as visible as its message: open channels see 
   h.adapter.change!(change({ kind: 'delete', content: null, mentioned: true, previouslyMentioned: true, actorId: null }));
   await until(() => h.pushed.length === 3, 'a deleted mention on a closed channel');
   assert.deepEqual(h.pushed[2].tags, ['chat:deleted', 'chat:mention']);
+  // A move into a stream the bot cannot see reads as a vanishing, not a deletion.
+  h.adapter.change!(change({ kind: 'delete', content: null, mentioned: true, previouslyMentioned: true, actorId: null, vanished: true }));
+  await until(() => h.pushed.length === 4, 'a vanished mention');
+  assert.equal((h.pushed[3].payload as { content: { text: string }[] }).content[0].text, '[deleted] [T id=10] [#general > deploys] Ann (mention): no longer visible to the bot (moved to a stream it cannot see) — was: "ship it"');
+  assert.equal((h.pushed[3].origin as { change: string }).change, 'delete');
 
   await h.close();
 });

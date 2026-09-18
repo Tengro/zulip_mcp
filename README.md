@@ -181,9 +181,11 @@ ambient edits. An unconditional per-channel policy wakes on every change;
 add `"tagsNone": ["chat:edited", "chat:deleted"]` to it if that is unwanted.
 `metadata` carries `change`, `targetMessageId(s)`, `previousContent`,
 `previousTopic`, `movedToChannelId`, `actorId`, `mentioned` and
-`previouslyMentioned`. A change line never sets `threadId` and never moves
+`previouslyMentioned` (absent when only the post-change state could be
+read). A change line never sets `threadId` and never moves this server's
 reply routing: a moderator archiving an old message does not retarget the
-reply the agent is composing. Synthetic ids (`edit:77:…`) never advance the
+reply the agent is composing. A move into a stream the bot cannot see
+arrives from Zulip as a deletion and is reported as "no longer visible". Synthetic ids (`edit:77:…`) never advance the
 delivery watermark; the message's own id in the line is what `fetch_around`
 takes (a deleted id can no longer be fetched). History and backscroll
 render `(edited)` and `(moved)` trailers with `metadata.editedAt` /
